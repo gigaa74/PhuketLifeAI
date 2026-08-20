@@ -18,31 +18,42 @@ def build_results_message(results, repeat_search=False):
         if item.get("result_type") != CONCRETE_PROPERTY
     ]
 
-    if concrete and not listing_pages:
-        header = (
-            "Вот ещё новые варианты:"
-            if repeat_search
-            else "Нашёл первые варианты жилья:"
+    lines = []
+    if concrete:
+        header = "Вот ещё новые варианты:" if repeat_search else "Нашёл первые варианты жилья:"
+        lines.append(header + "\n")
+        lines.extend(_format_results(concrete))
+        lines.append(
+            "Найдено в поисковом источнике — актуальность цены и "
+            "доступность нужно проверить перед бронированием.\n"
         )
-    elif listing_pages and not concrete:
-        header = (
-            "Вот ещё страницы с предложениями:"
-            if repeat_search
-            else "Нашли источники с предложениями жилья по вашим параметрам:"
-        )
-    else:
-        header = (
-            "Вот ещё новые результаты поиска:"
-            if repeat_search
-            else "Нашли варианты и страницы с предложениями жилья:"
-        )
+    if listing_pages:
+        if concrete:
+            header = (
+                "Вот ещё страницы с дополнительными предложениями:"
+                if repeat_search
+                else "Источники с дополнительными предложениями жилья:"
+            )
+        else:
+            header = (
+                "Вот ещё страницы с предложениями:"
+                if repeat_search
+                else "Нашли источники с предложениями жилья по вашим параметрам:"
+            )
+        lines.append(header + "\n")
+        lines.extend(_format_results(listing_pages))
+    return "\n".join(lines)
 
-    lines = [header + "\n"]
+
+def _format_results(results):
+    lines = []
     for index, item in enumerate(results, start=1):
-        name = item.get("name", "Результат поиска")
-        description = item.get("description", "")
+        name = item.get("title") or item.get("name", "Результат поиска")
+        description = item.get("snippet") or item.get("description", "")
         if len(description) > 250:
             description = description[:250] + "..."
         url = item.get("url", "")
-        lines.append(f"{index}. {name}\n{description}\n{url}\n")
-    return "\n".join(lines)
+        price_text = item.get("price_text", "")
+        price_line = f"\nЦена в источнике: {price_text}" if price_text else ""
+        lines.append(f"{index}. {name}\n{description}{price_line}\n{url}\n")
+    return lines

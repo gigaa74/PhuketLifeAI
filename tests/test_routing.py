@@ -71,6 +71,60 @@ class RoutingTests(unittest.TestCase):
         route = route_message("А еще?", None)
         self.assertEqual(route["intent"], CONVERSATION)
 
+    def test_natural_repeat_phrases_use_housing_search_context(self):
+        presented_case = dict(READY_HOUSING_CASE, status="results_presented")
+        examples = (
+            "Можешь показать еще?",
+            "Можешь показать ещё варианты?",
+            "Покажи еще",
+            "Покажи ещё варианты",
+            "Можешь найти еще?",
+            "Есть что-нибудь еще?",
+            "Давай еще",
+            "Давай ещё варианты",
+            "Найди другие варианты",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                route = route_message(text, presented_case)
+                self.assertEqual(route["intent"], SEARCH_REQUEST)
+
+    def test_repeat_routing_is_insensitive_to_spacing_case_and_punctuation(self):
+        presented_case = dict(READY_HOUSING_CASE, status="results_presented")
+        examples = (
+            "Можешь показать еще?",
+            "Можешь показать еще ?",
+            " можешь показать ещё? ",
+            "Можешь   показать   еще???",
+            "ПОКАЖИ ЕЩЁ",
+            "Давай еще!",
+            "Есть что-нибудь ещё ?",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                route = route_message(text, presented_case)
+                self.assertEqual(route["intent"], SEARCH_REQUEST)
+
+    def test_normalized_repeat_variants_without_context_are_conversation(self):
+        for text in (
+            "Можешь показать еще ?",
+            " Можешь   показать ещё??? ",
+            "ПОКАЖИ ЕЩЁ",
+            "Есть что-нибудь ещё ?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(route_message(text, None)["intent"], CONVERSATION)
+
+    def test_natural_repeat_phrases_without_context_are_conversation(self):
+        for text in (
+            "Можешь показать еще?",
+            "Можешь показать ещё варианты?",
+            "Давай еще",
+        ):
+            with self.subTest(text=text):
+                route = route_message(text, None)
+                self.assertEqual(route["intent"], CONVERSATION)
+
     def test_quantified_repeat_extracts_requested_limit(self):
         presented_case = dict(READY_HOUSING_CASE, status="results_presented")
         examples = (
@@ -96,8 +150,10 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(route["requested_result_limit"], 10)
 
     def test_parameter_with_word_more_is_not_misrouted_as_repeat(self):
-        route = route_message("Еще лучше Rawai", READY_HOUSING_CASE)
-        self.assertEqual(route["intent"], CASE_UPDATE)
+        for text in ("Еще лучше Rawai", "Ещё лучше Rawai?"):
+            with self.subTest(text=text):
+                route = route_message(text, READY_HOUSING_CASE)
+                self.assertEqual(route["intent"], CASE_UPDATE)
 
     def test_natural_housing_requests_route_to_new_housing_case(self):
         examples = (

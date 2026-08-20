@@ -43,6 +43,14 @@ SHORT_SEARCH_PHRASES = {
     "есть еще",
 }
 
+NATURAL_REPEAT_PATTERNS = (
+    r"^(?:мож(?:ешь|ете)\s+)?(?:показать|покажи|найти|найди)\s+"
+    r"(?:ещ[её]|другие)(?:\s+вариант\w*)?$",
+    r"^есть\s+(?:что-нибудь|что\s+нибудь)\s+ещ[её]"
+    r"(?:\s+вариант\w*)?$",
+    r"^давай\s+ещ[её](?:\s+вариант\w*)?$",
+)
+
 QUANTIFIED_SEARCH_MARKERS = (
     "скинь",
     "покажи",
@@ -131,8 +139,10 @@ HOUSING_UPDATE_MARKERS = (
 
 
 def normalize_message(text):
-    normalized = " ".join(str(text or "").lower().strip().split())
-    return normalized.strip(".!?,;:")
+    normalized = str(text or "").casefold().strip()
+    normalized = " ".join(normalized.split())
+    normalized = re.sub(r"\s+([?!.,;:])", r"\1", normalized)
+    return normalized.rstrip(".!?,;:").rstrip()
 
 
 def detect_new_category(text, existing_category=None):
@@ -149,6 +159,10 @@ def is_repeat_search_request(normalized):
     return (
         normalized in SHORT_SEARCH_PHRASES
         or any(phrase in normalized for phrase in SEARCH_PHRASES)
+        or any(
+            re.search(pattern, normalized)
+            for pattern in NATURAL_REPEAT_PATTERNS
+        )
     )
 
 
@@ -172,6 +186,11 @@ def route_message(text, existing_case=None):
     if normalized in CONVERSATION_PHRASES:
         return {"intent": CONVERSATION, "category": None}
 
+    existing_category = existing_case.get("category") if existing_case else None
+    new_category = detect_new_category(normalized, existing_category)
+    if new_category:
+        return {"intent": NEW_CASE, "category": new_category}
+
     has_search_context = bool(
         existing_case
         and existing_case.get("category") == "housing"
@@ -193,16 +212,11 @@ def route_message(text, existing_case=None):
     if repeat_search:
         return {"intent": CONVERSATION, "category": None}
 
-    existing_category = existing_case.get("category") if existing_case else None
     housing_intent = any(
         marker in normalized for marker in HOUSING_INTENT_MARKERS
     )
     if housing_intent and existing_category != "housing":
         return {"intent": NEW_CASE, "category": "housing"}
-
-    new_category = detect_new_category(normalized, existing_category)
-    if new_category:
-        return {"intent": NEW_CASE, "category": new_category}
 
     if not existing_case:
         return {"intent": NEW_CASE, "category": None}

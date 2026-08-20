@@ -34,6 +34,13 @@ class TruthfulnessTests(unittest.TestCase):
         )
         self.assertEqual(guarded, TRUTHFUL_FALLBACK)
 
+    def test_conversational_model_cannot_claim_confirmed_options(self):
+        guarded = guard_conversational_answer(
+            "По текущим параметрам новых подтверждённых вариантов пока нет."
+        )
+        self.assertEqual(guarded, TRUTHFUL_FALLBACK)
+        self.assertNotIn("подтверждённые варианты", guarded.lower())
+
     def test_error_and_no_results_do_not_promise_background_work(self):
         combined = (
             INITIAL_NO_RESULTS_MESSAGE

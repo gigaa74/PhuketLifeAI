@@ -21,164 +21,99 @@ class YandexSearchProvider:
         self.url = "https://searchapi.api.cloud.yandex.net/v2/web/search"
 
     def search(self, search_request):
-        query_text = self._build_query(search_request)
-
         headers = {
             "Authorization": f"Api-Key {self.api_key}",
             "Content-Type": "application/json",
         }
 
-        payload = {
-            "query": {
-                "searchType": "SEARCH_TYPE_COM",
-                "queryText": query_text,
-                "page": str(search_request.get("page", 0)),
-            },
-            "folderId": self.folder_id,
-            "responseFormat": "FORMAT_XML",
-            "groupSpec": {
-                "groupMode": "GROUP_MODE_FLAT",
-                "groupsOnPage": str(
-                    search_request.get("result_limit", 10)
-                ),
-                "docsInGroup": "1",
-            },
-        }
+        result_limit = max(1, min(int(search_request.get("result_limit", 5)), 10))
+        discovery_limit = max(result_limit, 5)
+        results = []
+        seen_urls = set()
+        successful_queries = 0
+        first_error = None
 
-        response = requests.post(
-            self.url,
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
+        for query_text in self._build_queries(search_request):
+            payload = {
+                "query": {
+                    "searchType": "SEARCH_TYPE_COM",
+                    "queryText": query_text,
+                    "page": str(search_request.get("page", 0)),
+                },
+                "folderId": self.folder_id,
+                "responseFormat": "FORMAT_XML",
+                "groupSpec": {
+                    "groupMode": "GROUP_MODE_FLAT",
+                    "groupsOnPage": str(discovery_limit),
+                    "docsInGroup": "1",
+                },
+            }
+            try:
+                response = requests.post(
+                    self.url, headers=headers, json=payload, timeout=30
+                )
+                response.raise_for_status()
+                raw_data = response.json().get("rawData")
+                successful_queries += 1
+            except requests.RequestException as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            if not raw_data:
+                continue
+            xml_text = base64.b64decode(raw_data).decode(
+                "utf-8", errors="replace"
+            )
+            for item in self._parse_xml(xml_text, limit=discovery_limit):
+                identifier = item.get("url", "").strip().lower().rstrip("/")
+                if identifier and identifier not in seen_urls:
+                    seen_urls.add(identifier)
+                    results.append(item)
 
-        response.raise_for_status()
+        if not successful_queries and first_error is not None:
+            raise first_error
+        return results
 
-        data = response.json()
+    def _build_queries(self, search_request):
+        from search_engine import build_concrete_search_queries
 
-        raw_data = data.get("rawData")
-
-        if not raw_data:
-            return []
-
-        xml_text = base64.b64decode(raw_data).decode(
-            "utf-8",
-            errors="replace",
-        )
-
-        return self._parse_xml(
-            xml_text,
-            limit=search_request.get("result_limit", 10),
-        )
+        return build_concrete_search_queries(search_request)
 
     def _build_query(self, search_request):
-        parts = [
-            "Phuket Thailand",
-            "apartment condo house rental",
+        return self._build_queries(search_request)[0]
+
+    @classmethod
+    def _extract_price_data(cls, text):
+        if not text:
+            return None, "", ""
+
+        for pattern, currency in cls._price_patterns():
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            number_text = re.sub(r"[^\d]", "", match.group(1))
+            if not number_text:
+                continue
+            price = int(number_text)
+            if price > 0:
+                return price, currency, match.group(0).strip()
+        return None, "", ""
+
+    @staticmethod
+    def _price_patterns():
+        return [
+            (r"฿\s*([\d\s,]+)", "THB"),
+            (r"([\d\s,]+)\s*(?:บาท|THB)", "THB"),
+            (r"₽\s*([\d\s,]+)", "RUB"),
+            (r"([\d\s,]+)\s*(?:руб(?:лей|ля|ль)?|RUB)", "RUB"),
+            (r"\$\s*([\d\s,]+)", "USD"),
+            (r"([\d\s,]+)\s*USD", "USD"),
         ]
-
-        location = search_request.get("location")
-
-        if location:
-            parts.append(
-                str(location)
-            )
-
-        housing_type = search_request.get(
-            "housing_type"
-        )
-
-        if housing_type:
-            parts.append(
-                str(housing_type)
-            )
-
-        budget = search_request.get(
-            "budget_original"
-        )
-
-        if budget:
-            parts.append(
-                str(budget)
-            )
-
-        if search_request.get(
-            "has_pet"
-        ):
-            parts.append(
-                "pet friendly"
-            )
-
-        return " ".join(parts)
 
     @staticmethod
     def _extract_price(text):
-        if not text:
-            return None, ""
-
-        patterns = [
-            (
-                r"฿\s*([\d\s,]+)",
-                "THB",
-            ),
-            (
-                r"([\d\s,]+)\s*(?:บาท|THB)",
-                "THB",
-            ),
-            (
-                r"₽\s*([\d\s,]+)",
-                "RUB",
-            ),
-            (
-                r"([\d\s,]+)\s*(?:руб(?:лей|ля|ль)?|RUB)",
-                "RUB",
-            ),
-            (
-                r"\$\s*([\d\s,]+)",
-                "USD",
-            ),
-            (
-                r"([\d\s,]+)\s*USD",
-                "USD",
-            ),
-        ]
-
-        for pattern, currency in patterns:
-            match = re.search(
-                pattern,
-                text,
-                flags=re.IGNORECASE,
-            )
-
-            if not match:
-                continue
-
-            number_text = (
-                match.group(1)
-            )
-
-            number_text = re.sub(
-                r"[^\d]",
-                "",
-                number_text,
-            )
-
-            if not number_text:
-                continue
-
-            try:
-                price = int(
-                    number_text
-                )
-            except ValueError:
-                continue
-
-            if price <= 0:
-                continue
-
-            return price, currency
-
-        return None, ""
+        price, currency, _ = YandexSearchProvider._extract_price_data(text)
+        return price, currency
 
     def _parse_xml(
         self,
@@ -250,8 +185,8 @@ class YandexSearchProvider:
                 passages
             ).strip()
 
-            price, currency = (
-                self._extract_price(
+            price, currency, price_text = (
+                self._extract_price_data(
                     f"{title} {snippet}"
                 )
             )
@@ -263,6 +198,7 @@ class YandexSearchProvider:
                     "location": "",
                     "address": "",
                     "price": price,
+                    "price_text": price_text,
                     "currency": currency,
                     "price_rub": None,
                     "rating": None,

@@ -65,6 +65,36 @@ class SearchPresentationTests(unittest.TestCase):
         self.assertIn("Вот ещё страницы с предложениями:", message)
         self.assertNotIn("основные параметры", message.lower())
 
+    def test_mixed_results_are_presented_in_separate_sections(self):
+        results = [
+            {
+                "title": f"Concrete {index}",
+                "url": f"https://booking.com/hotel/th/concrete-{index}.html",
+                "result_type": CONCRETE_PROPERTY,
+            }
+            for index in range(1, 4)
+        ]
+        results.extend(
+            [
+                {
+                    "title": "Rawai catalog",
+                    "url": "https://example.com/property-for-rent/rawai",
+                    "result_type": LISTING_PAGE,
+                },
+                {
+                    "title": "Phuket catalog",
+                    "url": "https://example.com/property-for-rent/phuket",
+                    "result_type": LISTING_PAGE,
+                },
+            ]
+        )
+        message = build_results_message(results)
+        self.assertIn("Нашёл первые варианты жилья:", message)
+        self.assertIn("Источники с дополнительными предложениями жилья:", message)
+        self.assertIn("актуальность цены и доступность нужно проверить", message)
+        self.assertNotIn("доступно на ваши даты", message.lower())
+        self.assertNotIn("можно забронировать", message.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,5 @@
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from search_presentation import CONCRETE_PROPERTY, LISTING_PAGE
 
@@ -452,6 +452,33 @@ def build_search_request(case):
     }
 
 
+def build_concrete_search_queries(search_request):
+    """Build focused discovery queries without inventing offer facts."""
+    location = str(search_request.get("location") or "Phuket").strip()
+    housing_type = str(
+        search_request.get("housing_type") or "apartment condo hotel"
+    ).strip()
+    dates = " ".join(
+        str(search_request.get(field) or "").strip()
+        for field in ("arrival_date", "departure_date")
+    ).strip()
+    pet = " pet friendly" if search_request.get("has_pet") else ""
+    place = location if "phuket" in location.lower() else f"{location} Phuket"
+    context = " ".join(part for part in (place, dates) if part)
+
+    queries = [
+        f"{context} {housing_type} rent{pet}",
+        f"{location} Phuket condo rent specific property{pet}",
+        f"{location} Phuket hotel Booking{pet}",
+        f"site:booking.com/hotel {context}{pet}",
+        f"site:airbnb.com/rooms {context}{pet}",
+        f"site:fazwaz.com property rent {location} Phuket{pet}",
+        f"site:thailand-property.com property {location} Phuket rent{pet}",
+        f"{location} Пхукет аренда конкретные апартаменты{pet}",
+    ]
+    return list(dict.fromkeys(" ".join(query.split()) for query in queries))
+
+
 # =========================================================
 # NORMALIZED RESULT
 # =========================================================
@@ -491,25 +518,29 @@ def normalize_result(
         except Exception:
             domain = ""
 
+    title = str(result.get("title") or result.get("name") or "")
+    snippet = str(result.get("snippet") or result.get("description") or "")
+    location_text = str(
+        result.get("location_text") or result.get("location") or ""
+    )
+
     return {
         "source": source_name,
 
         "domain": domain,
 
-        "name": result.get(
-            "name",
-            "",
-        ),
+        "title": title,
+
+        "name": title,
 
         "property_type": result.get(
             "property_type",
             "",
         ),
 
-        "location": result.get(
-            "location",
-            "",
-        ),
+        "location_text": location_text,
+
+        "location": location_text,
 
         "address": result.get(
             "address",
@@ -519,6 +550,8 @@ def normalize_result(
         "price": result.get(
             "price"
         ),
+
+        "price_text": str(result.get("price_text") or ""),
 
         "currency": result.get(
             "currency",
@@ -548,16 +581,19 @@ def normalize_result(
             "",
         ),
 
-        "description": result.get(
-            "description",
-            "",
-        ),
+        "snippet": snippet,
+
+        "description": snippet,
 
         "result_type": result.get("result_type") or classify_result_type(
             result
         ),
 
         "search_score": 0,
+
+        "retrieved_at": result.get("retrieved_at") or datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
 
 
@@ -572,6 +608,7 @@ def classify_result_type(result):
         "/stays/",
         "/properties",
         "/property-for-rent",
+        "/apartments/city/",
         "/condos",
         "/apartments",
         "лучших",
@@ -584,8 +621,10 @@ def classify_result_type(result):
         return LISTING_PAGE
 
     concrete_patterns = (
-        r"booking\.com/hotel/[^/]+/[^/?#]+",
+        r"booking\.[^/]+/hotel/[^/]+/[^/?#]+",
         r"airbnb\.[^/]+/rooms/\d+",
+        r"fazwaz\.[^/]+/(?:property-rent|property-sale)/[^/?#]+",
+        r"thailand-property\.[^/]+/property/[^/?#]+",
         r"/property/[^/?#]+",
         r"/listing/[^/?#]+",
     )
@@ -1016,6 +1055,7 @@ class HousingSearchEngine:
                 rating = 0
 
             return (
+                1 if item.get("result_type") == CONCRETE_PROPERTY else 0,
                 score,
                 rating,
             )
@@ -1114,6 +1154,7 @@ def search_housing(
         search_request
     )
     results = execution["results"]
+    results = results[:search_request["result_limit"]]
     status = execution["status"]
 
     if status == SEARCH_WITH_RESULTS:

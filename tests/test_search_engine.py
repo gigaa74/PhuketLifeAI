@@ -5,14 +5,18 @@ from search_engine import (
     HousingSearchEngine,
     SEARCH_NO_RESULTS,
     SEARCH_PROVIDER_ERROR,
+    build_concrete_search_queries,
     build_search_request,
+    classify_result_type,
     get_rental_type,
     has_pet,
+    normalize_result,
     parse_budget_rub,
     parse_people,
     search_housing,
     validate_case,
 )
+from search_presentation import CONCRETE_PROPERTY, LISTING_PAGE
 
 
 class StubProvider:
@@ -110,6 +114,134 @@ class SearchEngineTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["source"], "stub")
         self.assertGreater(results[0]["search_score"], 0)
+
+    def test_concrete_property_ranks_above_category_page(self):
+        class MixedProvider:
+            name = "mixed"
+
+            def search(self, search_request):
+                return [
+                    {
+                        "name": "Rawai property catalog",
+                        "url": "https://example.com/property-for-rent/rawai",
+                    },
+                    {
+                        "name": "Specific Rawai residence",
+                        "url": "https://booking.com/hotel/th/rawai-residence.html",
+                    },
+                ]
+
+        results = HousingSearchEngine([MixedProvider()]).search(
+            {"arrival_date": "1 сентября 2026", "departure_date": "15 сентября 2026"}
+        )
+        self.assertEqual(results[0]["result_type"], CONCRETE_PROPERTY)
+        self.assertEqual(results[1]["result_type"], LISTING_PAGE)
+
+    def test_concrete_query_builder_creates_targeted_discovery_queries(self):
+        queries = build_concrete_search_queries(
+            {
+                "location": "Rawai",
+                "housing_type": "apartment",
+                "arrival_date": "1 September 2026",
+                "departure_date": "15 September 2026",
+            }
+        )
+        self.assertGreaterEqual(len(queries), 5)
+        self.assertTrue(any("site:booking.com/hotel" in query for query in queries))
+        self.assertTrue(any("site:airbnb.com/rooms" in query for query in queries))
+        self.assertTrue(any("specific property" in query for query in queries))
+
+    def test_booking_hotel_page_is_concrete(self):
+        self.assertEqual(
+            classify_result_type(
+                {"url": "https://www.booking.com/hotel/th/rawai-residence.html"}
+            ),
+            CONCRETE_PROPERTY,
+        )
+
+    def test_booking_city_apartments_page_is_listing(self):
+        self.assertEqual(
+            classify_result_type(
+                {"url": "https://www.booking.com/apartments/city/th/phuket.html"}
+            ),
+            LISTING_PAGE,
+        )
+
+    def test_price_text_is_preserved_only_from_provider_data(self):
+        without_provider_price = normalize_result(
+            {
+                "name": "Rawai residence",
+                "url": "https://example.com/property/rawai-residence",
+                "description": "Apartments near the beach from 5000 THB",
+            },
+            "stub",
+        )
+        with_provider_price = normalize_result(
+            {
+                "name": "Rawai residence",
+                "url": "https://example.com/property/rawai-residence-2",
+                "price_text": "5 000 THB",
+            },
+            "stub",
+        )
+        self.assertEqual(without_provider_price["price_text"], "")
+        self.assertEqual(with_provider_price["price_text"], "5 000 THB")
+        self.assertIn("T", with_provider_price["retrieved_at"])
+
+    def test_repeat_excludes_already_shown_concrete_url(self):
+        concrete_url = "https://booking.com/hotel/th/rawai-residence.html"
+
+        class ConcreteProvider:
+            name = "concrete"
+
+            def search(self, search_request):
+                return [
+                    {"name": "Old", "url": concrete_url},
+                    {
+                        "name": "New",
+                        "url": "https://airbnb.com/rooms/123456",
+                    },
+                ]
+
+        result = search_housing(
+            self._ready_case(),
+            providers=[ConcreteProvider()],
+            excluded_urls=[concrete_url],
+            repeat_search=True,
+        )
+        self.assertEqual([item["name"] for item in result["results"]], ["New"])
+
+    def test_requested_limit_is_filled_with_separate_listing_fallbacks(self):
+        class ThreeConcreteProvider:
+            name = "mixed"
+
+            def search(self, search_request):
+                concrete = [
+                    {
+                        "name": f"Concrete {index}",
+                        "url": f"https://booking.com/hotel/th/concrete-{index}.html",
+                    }
+                    for index in range(3)
+                ]
+                listings = [
+                    {
+                        "name": f"Catalog {index}",
+                        "url": f"https://example.com/property-for-rent/{index}",
+                    }
+                    for index in range(3)
+                ]
+                return listings + concrete
+
+        result = search_housing(
+            self._ready_case(),
+            providers=[ThreeConcreteProvider()],
+            result_limit=5,
+        )
+        self.assertEqual(len(result["results"]), 5)
+        self.assertEqual(
+            [item["result_type"] for item in result["results"]],
+            [CONCRETE_PROPERTY] * 3 + [LISTING_PAGE] * 2,
+        )
 
     def test_empty_provider_is_no_results(self):
         result = search_housing(
