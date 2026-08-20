@@ -41,6 +41,17 @@ class TruthfulnessTests(unittest.TestCase):
         self.assertEqual(guarded, TRUTHFUL_FALLBACK)
         self.assertNotIn("подтверждённые варианты", guarded.lower())
 
+    def test_conversational_model_cannot_invent_partner_actions(self):
+        for generated in (
+            "Запрос отправлен партнёру.",
+            "Партнёр ответил и предложил виллу.",
+            "Партнер предложил вариант трансфера.",
+        ):
+            with self.subTest(generated=generated):
+                self.assertEqual(
+                    guard_conversational_answer(generated), TRUTHFUL_FALLBACK
+                )
+
     def test_error_and_no_results_do_not_promise_background_work(self):
         combined = (
             INITIAL_NO_RESULTS_MESSAGE

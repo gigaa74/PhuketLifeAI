@@ -28,6 +28,18 @@ class ConfigTests(unittest.TestCase):
             )
         self.assertEqual(settings.gigachat_tls_verify, str(bundle))
 
+    def test_optional_admin_user_id_is_parsed(self):
+        settings = load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "telegram-secret",
+                "GIGACHAT_API_KEY": "gigachat-secret",
+                "YANDEX_SEARCH_API_KEY": "yandex-secret",
+                "YANDEX_FOLDER_ID": "folder-id",
+                "TELEGRAM_ADMIN_USER_ID": "123456",
+            }
+        )
+        self.assertEqual(settings.telegram_admin_user_id, 123456)
+
 
 if __name__ == "__main__":
     unittest.main()

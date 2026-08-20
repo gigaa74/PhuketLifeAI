@@ -10,10 +10,30 @@ import requests
 from telegram import Update
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
+)
+from partner_network import (
+    DuplicatePartnerRequestError,
+    PartnerNetworkError,
+    PartnerTelegramError,
+    PartnerUnavailableError,
+    create_partner,
+    create_partner_invite,
+    find_partners_for_case,
+    get_case_for_partner,
+    get_partner,
+    is_admin,
+    list_partner_requests,
+    list_partners,
+    onboard_partner,
+    record_partner_reply,
+    send_case_to_partner,
+    set_partner_status,
+    update_partner,
 )
 
 from case_engine import (
@@ -800,6 +820,25 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if context.args and context.args[0].startswith("partner_"):
+        token = context.args[0][len("partner_"):]
+        try:
+            partner = onboard_partner(
+                token,
+                update.effective_user.id,
+                update.effective_user.username,
+            )
+        except PartnerUnavailableError:
+            await update.message.reply_text(
+                "Ссылка приглашения недействительна или уже использована."
+            )
+            return
+        await update.message.reply_text(
+            f"Партнёр {partner['name']} подключён к Phuket Life. 🤝\n\n"
+            "Теперь отвечайте reply на сообщения с запросами."
+        )
+        return
+
     get_or_create_client(update)
 
     await update.message.reply_text(
@@ -810,6 +849,202 @@ async def start(
         "пребыванием в Таиланде.\n\n"
         "Расскажите, что вам необходимо."
     )
+
+
+async def _require_admin(update):
+    if is_admin(SETTINGS.telegram_admin_user_id, update.effective_user.id):
+        return True
+    await update.message.reply_text("Команда доступна только администратору.")
+    return False
+
+
+async def partners_command(update, context):
+    if not await _require_admin(update):
+        return
+    partners = list_partners()
+    if not partners:
+        await update.message.reply_text("Партнёры пока не добавлены.")
+        return
+    lines = ["🤝 Партнёры"]
+    for partner in partners:
+        connected = "Telegram подключён" if partner.get("telegram_user_id") else "не подключён"
+        lines.append(
+            f"#{partner['id']} {partner['name']} — {partner['status']}\n"
+            f"Услуги: {', '.join(partner['services']) or '—'}; {connected}"
+        )
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def partner_requests_command(update, context):
+    if not await _require_admin(update):
+        return
+    requests_list = list_partner_requests()
+    if not requests_list:
+        await update.message.reply_text("Запросов партнёрам пока нет.")
+        return
+    lines = ["📨 Последние запросы партнёрам"]
+    for item in requests_list:
+        lines.append(
+            f"#{item['id']} case #{item['case_id']} → "
+            f"{item['partner_name']} [{item['status']}]"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def case_partners_command(update, context):
+    if not await _require_admin(update):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /case_partners <case_id>")
+        return
+    try:
+        case = get_case_for_partner(int(context.args[0]))
+        partners = find_partners_for_case(case)
+    except PartnerNetworkError as error:
+        await update.message.reply_text(str(error))
+        return
+    if not partners:
+        await update.message.reply_text("Подходящих активных партнёров не найдено.")
+        return
+    await update.message.reply_text(
+        "\n".join(
+            f"#{partner['id']} {partner['name']} — {', '.join(partner['services'])}"
+            for partner in partners
+        )
+    )
+
+
+async def send_partner_command(update, context):
+    if not await _require_admin(update):
+        return
+    if len(context.args) != 2 or not all(arg.isdigit() for arg in context.args):
+        await update.message.reply_text(
+            "Использование: /send_partner <case_id> <partner_id>"
+        )
+        return
+    case_id, partner_id = map(int, context.args)
+    try:
+        request = await send_case_to_partner(
+            case_id, partner_id, context.bot.send_message
+        )
+    except DuplicatePartnerRequestError:
+        await update.message.reply_text(
+            "Активный запрос этому партнёру уже существует."
+        )
+        return
+    except PartnerTelegramError:
+        await update.message.reply_text(
+            "Telegram не подтвердил отправку. Запрос отмечен как failed."
+        )
+        return
+    except PartnerNetworkError as error:
+        await update.message.reply_text(str(error))
+        return
+    await update.message.reply_text(
+        f"Запрос #{request['id']} подтверждён Telegram и отправлен партнёру."
+    )
+
+
+async def partner_create_command(update, context):
+    if not await _require_admin(update):
+        return
+    raw = update.message.text.partition(" ")[2]
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        await update.message.reply_text(
+            "Использование: /partner_create Имя | housing,transfer | Rawai,Kata"
+        )
+        return
+    try:
+        partner = create_partner(
+            parts[0], parts[1], parts[2] if len(parts) > 2 else None
+        )
+        token = create_partner_invite(partner["id"])
+    except (ValueError, PartnerNetworkError) as error:
+        await update.message.reply_text(str(error))
+        return
+    bot_username = context.bot.username
+    link = f"https://t.me/{bot_username}?start=partner_{token}"
+    await update.message.reply_text(
+        f"Создан партнёр #{partner['id']} {partner['name']} (candidate).\n"
+        f"Одноразовая ссылка подключения:\n{link}"
+    )
+
+
+async def partner_status_command(update, context):
+    if not await _require_admin(update):
+        return
+    if len(context.args) != 2 or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Использование: /partner_status <partner_id> <active|paused|blocked|candidate>"
+        )
+        return
+    try:
+        partner = set_partner_status(int(context.args[0]), context.args[1])
+    except (ValueError, PartnerNetworkError) as error:
+        await update.message.reply_text(str(error))
+        return
+    await update.message.reply_text(
+        f"Партнёр #{partner['id']}: статус {partner['status']}."
+    )
+
+
+async def partner_update_command(update, context):
+    if not await _require_admin(update):
+        return
+    raw = update.message.text.partition(" ")[2]
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) < 2 or not parts[0].isdigit():
+        await update.message.reply_text(
+            "Использование: /partner_update <id> | services | areas | notes"
+        )
+        return
+    try:
+        partner = update_partner(
+            int(parts[0]),
+            services=parts[1] or None,
+            areas=parts[2] if len(parts) > 2 else None,
+            notes=parts[3] if len(parts) > 3 else None,
+        )
+    except (ValueError, PartnerNetworkError) as error:
+        await update.message.reply_text(str(error))
+        return
+    await update.message.reply_text(f"Партнёр #{partner['id']} обновлён.")
+
+
+async def partner_reply_handler(update, context):
+    message = update.message
+    if not message or not message.reply_to_message or not message.text:
+        return
+    request = record_partner_reply(
+        update.effective_user.id,
+        message.reply_to_message.message_id,
+        message.text,
+    )
+    if not request:
+        return
+    await message.reply_text("Ответ сохранён и передан администратору Phuket Life.")
+    admin_id = SETTINGS.telegram_admin_user_id
+    if admin_id:
+        partner = get_partner(request["partner_id"])
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "🤝 Ответ партнёра\n\n"
+                    f"Запрос #{request['id']} / case #{request['case_id']}\n"
+                    f"Партнёр: {partner['name']}\n"
+                    f"Категория: {request['service_category']}\n"
+                    f"Статус: {request['status']}\n\n"
+                    f"Ответ:\n{request['partner_response']}"
+                ),
+            )
+        except Exception as error:
+            print(
+                "[PARTNER] Не удалось уведомить администратора: "
+                f"{type(error).__name__}"
+            )
+    raise ApplicationHandlerStop
 
 
 # =========================================================
@@ -1225,6 +1460,25 @@ def main():
             "clear",
             clear
         )
+    )
+
+    for command, callback in (
+        ("partners", partners_command),
+        ("partner_requests", partner_requests_command),
+        ("case_partners", case_partners_command),
+        ("send_partner", send_partner_command),
+        ("partner_create", partner_create_command),
+        ("partner_status", partner_status_command),
+        ("partner_update", partner_update_command),
+    ):
+        app.add_handler(CommandHandler(command, callback))
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.REPLY & ~filters.COMMAND,
+            partner_reply_handler,
+        ),
+        group=-1,
     )
 
     app.add_handler(

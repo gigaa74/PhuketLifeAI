@@ -93,10 +93,77 @@ def _migration_003_indexes(connection):
     )
 
 
+def _migration_004_partner_network(connection):
+    partner_columns = _column_names(connection, "partners")
+    additions = (
+        ("location", "TEXT"),
+        ("services", "TEXT"),
+        ("contacts", "TEXT"),
+        ("notes", "TEXT"),
+        ("status", "TEXT DEFAULT 'candidate'"),
+        ("created_at", "TIMESTAMP"),
+        ("telegram_user_id", "INTEGER"),
+        ("telegram_username", "TEXT"),
+        ("areas", "TEXT"),
+        ("commission_notes", "TEXT"),
+        ("updated_at", "TIMESTAMP"),
+        ("invite_token_hash", "TEXT"),
+    )
+    for name, definition in additions:
+        if name not in partner_columns:
+            connection.execute(
+                f"ALTER TABLE partners ADD COLUMN {name} {definition}"
+            )
+    connection.execute(
+        "UPDATE partners SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"
+    )
+    connection.execute(
+        "UPDATE partners SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)"
+    )
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS partner_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_id INTEGER NOT NULL,
+            partner_id INTEGER NOT NULL,
+            service_category TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'created',
+            request_payload TEXT NOT NULL,
+            partner_response TEXT,
+            telegram_message_id INTEGER,
+            error_code TEXT,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sent_at TIMESTAMP,
+            responded_at TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (case_id) REFERENCES cases(id),
+            FOREIGN KEY (partner_id) REFERENCES partners(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_partners_telegram_user_id
+            ON partners(telegram_user_id)
+            WHERE telegram_user_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_partners_invite_token_hash
+            ON partners(invite_token_hash)
+            WHERE invite_token_hash IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_partners_status
+            ON partners(status, id);
+        CREATE INDEX IF NOT EXISTS idx_partner_requests_case_id
+            ON partner_requests(case_id, id);
+        CREATE INDEX IF NOT EXISTS idx_partner_requests_partner_id
+            ON partner_requests(partner_id, id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_requests_active_unique
+            ON partner_requests(case_id, partner_id, service_category)
+            WHERE status IN ('created', 'sent');
+        """
+    )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
     (3, _migration_003_indexes),
+    (4, _migration_004_partner_network),
 )
 
 

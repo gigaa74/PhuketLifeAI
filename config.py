@@ -14,6 +14,7 @@ class Settings:
     yandex_search_api_key: str
     yandex_folder_id: str
     gigachat_ca_bundle: str | None = None
+    telegram_admin_user_id: int | None = None
 
     @property
     def gigachat_tls_verify(self):
@@ -43,10 +44,19 @@ def load_settings(environ=None):
             + ca_bundle
         )
 
+    admin_user_id_text = values.get("TELEGRAM_ADMIN_USER_ID", "").strip()
+    try:
+        admin_user_id = int(admin_user_id_text) if admin_user_id_text else None
+    except ValueError as error:
+        raise ConfigurationError(
+            "TELEGRAM_ADMIN_USER_ID должен быть целым числом"
+        ) from error
+
     return Settings(
         telegram_bot_token=values["TELEGRAM_BOT_TOKEN"].strip(),
         gigachat_api_key=values["GIGACHAT_API_KEY"].strip(),
         yandex_search_api_key=values["YANDEX_SEARCH_API_KEY"].strip(),
         yandex_folder_id=values["YANDEX_FOLDER_ID"].strip(),
         gigachat_ca_bundle=ca_bundle,
+        telegram_admin_user_id=admin_user_id,
     )
