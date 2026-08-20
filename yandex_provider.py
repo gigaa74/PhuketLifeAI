@@ -1,10 +1,10 @@
-import os
 import re
 import base64
 import requests
 import xml.etree.ElementTree as ET
 
 from dotenv import load_dotenv
+from config import load_settings
 
 
 load_dotenv()
@@ -14,14 +14,9 @@ class YandexSearchProvider:
     name = "yandex"
 
     def __init__(self):
-        self.api_key = os.getenv("YANDEX_SEARCH_API_KEY")
-        self.folder_id = os.getenv("YANDEX_FOLDER_ID")
-
-        if not self.api_key:
-            raise ValueError("YANDEX_SEARCH_API_KEY не найден в .env")
-
-        if not self.folder_id:
-            raise ValueError("YANDEX_FOLDER_ID не найден в .env")
+        settings = load_settings()
+        self.api_key = settings.yandex_search_api_key
+        self.folder_id = settings.yandex_folder_id
 
         self.url = "https://searchapi.api.cloud.yandex.net/v2/web/search"
 

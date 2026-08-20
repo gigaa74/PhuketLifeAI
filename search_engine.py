@@ -2,9 +2,6 @@ import re
 from datetime import datetime
 from urllib.parse import urlparse
 
-from yandex_provider import YandexSearchProvider
-
-
 # =========================================================
 # SEARCH ENGINE
 # Phuket Life
@@ -960,6 +957,8 @@ def search_housing(case):
     Главная публичная функция поиска жилья.
     Именно её вызывает bot.py.
     """
+
+    from yandex_provider import YandexSearchProvider
 
     validation = validate_case(
         case
