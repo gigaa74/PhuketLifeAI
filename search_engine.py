@@ -1,6 +1,12 @@
 import re
 from datetime import datetime
 from urllib.parse import urlparse
+from search_presentation import CONCRETE_PROPERTY, LISTING_PAGE
+
+
+SEARCH_WITH_RESULTS = "with_results"
+SEARCH_NO_RESULTS = "no_results"
+SEARCH_PROVIDER_ERROR = "provider_error"
 
 # =========================================================
 # SEARCH ENGINE
@@ -547,8 +553,50 @@ def normalize_result(
             "",
         ),
 
+        "result_type": result.get("result_type") or classify_result_type(
+            result
+        ),
+
         "search_score": 0,
     }
+
+
+def classify_result_type(result):
+    """Conservatively distinguish object pages from catalogs/search pages."""
+    url = str(result.get("url", "")).lower()
+    title = str(result.get("name", "")).lower()
+    text = f"{title} {url}"
+
+    listing_markers = (
+        "/search",
+        "/stays/",
+        "/properties",
+        "/property-for-rent",
+        "/condos",
+        "/apartments",
+        "лучших",
+        "объявлен",
+        "предложен",
+        "недвижимость в",
+        "аренда жилья в",
+    )
+    if any(marker in text for marker in listing_markers):
+        return LISTING_PAGE
+
+    concrete_patterns = (
+        r"booking\.com/hotel/[^/]+/[^/?#]+",
+        r"airbnb\.[^/]+/rooms/\d+",
+        r"/property/[^/?#]+",
+        r"/listing/[^/?#]+",
+    )
+    if any(re.search(pattern, url) for pattern in concrete_patterns):
+        return CONCRETE_PROPERTY
+
+    return LISTING_PAGE
+
+
+def normalize_result_identifier(url):
+    return str(url or "").strip().lower().rstrip("/")
 
 
 # =========================================================
@@ -806,13 +854,27 @@ class HousingSearchEngine:
         self,
         search_request,
     ):
+        return self.search_with_status(search_request)["results"]
+
+    def search_with_status(
+        self,
+        search_request,
+    ):
         all_results = []
+        provider_errors = []
+        successful_providers = 0
+        excluded_urls = {
+            normalize_result_identifier(url)
+            for url in search_request.get("excluded_urls", [])
+            if url
+        }
 
         for provider in self.providers:
             try:
                 results = provider.search(
                     search_request
                 )
+                successful_providers += 1
 
                 if not results:
                     continue
@@ -824,11 +886,17 @@ class HousingSearchEngine:
                     )
 
                     if normalized:
+                        identifier = normalize_result_identifier(
+                            normalized.get("url")
+                        )
+                        if identifier and identifier in excluded_urls:
+                            continue
                         all_results.append(
                             normalized
                         )
 
             except Exception as e:
+                provider_errors.append(provider.name)
                 print(
                     "[SEARCH] Ошибка источника "
                     f"{provider.name}: {e}"
@@ -843,7 +911,18 @@ class HousingSearchEngine:
             search_request,
         )
 
-        return all_results
+        if all_results:
+            status = SEARCH_WITH_RESULTS
+        elif successful_providers:
+            status = SEARCH_NO_RESULTS
+        else:
+            status = SEARCH_PROVIDER_ERROR
+
+        return {
+            "status": status,
+            "results": all_results,
+            "provider_errors": provider_errors,
+        }
 
     @staticmethod
     def remove_duplicates(
@@ -952,13 +1031,18 @@ class HousingSearchEngine:
 # PUBLIC SEARCH FUNCTION
 # =========================================================
 
-def search_housing(case):
+def search_housing(
+    case,
+    providers=None,
+    excluded_urls=None,
+    page=0,
+    repeat_search=False,
+    result_limit=5,
+):
     """
     Главная публичная функция поиска жилья.
     Именно её вызывает bot.py.
     """
-
-    from yandex_provider import YandexSearchProvider
 
     validation = validate_case(
         case
@@ -969,6 +1053,7 @@ def search_housing(case):
     ]:
         return {
             "success": False,
+            "status": "invalid_request",
 
             "message": validation[
                 "reason"
@@ -987,6 +1072,14 @@ def search_housing(case):
     search_request = build_search_request(
         case
     )
+    search_request.update(
+        {
+            "excluded_urls": list(excluded_urls or []),
+            "page": int(page),
+            "repeat_search": bool(repeat_search),
+            "result_limit": max(1, min(int(result_limit), 10)),
+        }
+    )
 
     print(
         "\n===== HOUSING SEARCH REQUEST ====="
@@ -1000,30 +1093,49 @@ def search_housing(case):
         "===================================\n"
     )
 
-    engine = HousingSearchEngine(
-        providers=[
-            YandexSearchProvider()
-        ]
-    )
+    if providers is None:
+        from yandex_provider import YandexSearchProvider
 
-    results = engine.search(
+        try:
+            providers = [YandexSearchProvider()]
+        except Exception as e:
+            print(f"[SEARCH] Ошибка инициализации источника: {e}")
+            return {
+                "success": False,
+                "status": SEARCH_PROVIDER_ERROR,
+                "message": "Поиск временно недоступен из-за ошибки источника.",
+                "request": search_request,
+                "results": [],
+            }
+
+    engine = HousingSearchEngine(providers=providers)
+
+    execution = engine.search_with_status(
         search_request
     )
+    results = execution["results"]
+    status = execution["status"]
 
-    if results:
+    if status == SEARCH_WITH_RESULTS:
         message = (
             "Найдено вариантов: "
             f"{len(results)}"
         )
 
-    else:
+    elif status == SEARCH_NO_RESULTS:
         message = (
             "Поисковый запрос сформирован. "
             "Подходящих предложений пока нет."
         )
+    else:
+        message = (
+            "Поиск временно недоступен из-за ошибки источника."
+        )
 
     return {
-        "success": True,
+        "success": status != SEARCH_PROVIDER_ERROR,
+
+        "status": status,
 
         "message": message,
 

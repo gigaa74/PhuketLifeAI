@@ -91,6 +91,26 @@ class DatabaseAndCaseTests(unittest.TestCase):
         self.assertEqual(ready_case["missing_data"], [])
         self.assertEqual(ready_case["data"], complete_data)
 
+        case_engine.set_case_status(case_id, "searching")
+        case_engine.set_case_status(case_id, "results_presented")
+        presented_case = case_engine.get_case(case_id)
+        self.assertEqual(presented_case["status"], "results_presented")
+
+    def test_new_category_does_not_reuse_cancelled_housing_case(self):
+        client_id = get_or_create_client(999, db_path=self.db_path)
+        housing_id = case_engine.get_or_create_case(
+            client_id, "housing", "Жильё"
+        )
+        case_engine.update_case(housing_id, {}, ["budget"], "active")
+        case_engine.set_case_status(housing_id, "cancelled")
+
+        transfer_id = case_engine.get_or_create_case(
+            client_id, "transfer", "Трансфер"
+        )
+        self.assertNotEqual(transfer_id, housing_id)
+        self.assertEqual(case_engine.get_case(housing_id)["category"], "housing")
+        self.assertEqual(case_engine.get_case(transfer_id)["category"], "transfer")
+
     def test_migration_preserves_existing_legacy_data(self):
         legacy_path = Path(self.temp_dir.name) / "legacy.db"
         connection = sqlite3.connect(legacy_path)
@@ -156,6 +176,31 @@ class CaseDataTests(unittest.TestCase):
         self.assertEqual(missing, ["people", "budget"])
         self.assertEqual(case_engine.get_case_status(missing), "active")
         self.assertEqual(case_engine.get_case_status([]), "ready_for_search")
+
+    def test_invalid_lifecycle_transition_is_rejected(self):
+        self.assertFalse(
+            case_engine.can_transition_case("active", "results_presented")
+        )
+
+    def test_search_state_is_not_exposed_to_ai_context(self):
+        context = case_engine.format_case_for_ai(
+            {
+                "id": 1,
+                "category": "housing",
+                "title": "Жильё",
+                "status": "results_presented",
+                "priority": "normal",
+                "data": {
+                    "budget": "60 000 рублей",
+                    "_search_state": {
+                        "shown_urls": ["https://example.com/private-state"]
+                    },
+                },
+                "missing_data": [],
+            }
+        )
+        self.assertIn("60 000 рублей", context)
+        self.assertNotIn("private-state", context)
 
 
 if __name__ == "__main__":

@@ -32,9 +32,17 @@ class YandexSearchProvider:
             "query": {
                 "searchType": "SEARCH_TYPE_COM",
                 "queryText": query_text,
+                "page": str(search_request.get("page", 0)),
             },
             "folderId": self.folder_id,
             "responseFormat": "FORMAT_XML",
+            "groupSpec": {
+                "groupMode": "GROUP_MODE_FLAT",
+                "groupsOnPage": str(
+                    search_request.get("result_limit", 10)
+                ),
+                "docsInGroup": "1",
+            },
         }
 
         response = requests.post(
@@ -60,7 +68,7 @@ class YandexSearchProvider:
 
         return self._parse_xml(
             xml_text,
-            limit=10,
+            limit=search_request.get("result_limit", 10),
         )
 
     def _build_query(self, search_request):

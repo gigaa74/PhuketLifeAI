@@ -4,6 +4,7 @@ load_dotenv()
 
 import uuid
 import json
+import time
 import requests
 
 from telegram import Update
@@ -16,16 +17,34 @@ from telegram.ext import (
 )
 
 from case_engine import (
-    get_or_create_case,
     update_case,
     get_client_active_case,
     format_case_for_ai,
     close_active_case,
-    merge_case_data,
-    get_housing_missing_fields,
-    get_case_status,
+    set_case_status,
 )
-from search_engine import search_housing
+from search_engine import SEARCH_PROVIDER_ERROR
+from message_router import (
+    CONVERSATION,
+    NEW_CASE,
+    SEARCH_REQUEST,
+    route_message,
+    should_start_search,
+)
+from token_cache import AccessTokenCache
+from async_utils import run_blocking
+from housing_flow import execute_housing_search
+from housing_flow import build_housing_missing_question
+from case_flow import persist_case_analysis
+from truthfulness import (
+    PROVIDER_ERROR_MESSAGE,
+    get_no_results_message,
+    guard_conversational_answer,
+)
+from search_presentation import (
+    build_pre_search_message,
+    build_results_message,
+)
 from config import load_settings
 from database import (
     init_db,
@@ -186,6 +205,11 @@ Phuket Life помогает туристам и экспатам в Таила�
 Не говори клиенту, что ты языковая модель.
 
 Представляйся AI-консьержем Phuket Life.
+
+Не утверждай, что внешнее действие выполнено, если приложение не передало
+подтверждённый результат этого действия. Не обещай фоновый поиск или будущую
+отправку результата: фоновых задач в системе нет. Общие рекомендации не
+подкрепляй точными процентами и числами без подтверждённых данных.
 """
 
 
@@ -291,7 +315,7 @@ def clear_history(client_id):
 # GIGACHAT TOKEN
 # =========================================================
 
-def get_access_token():
+def _fetch_access_token():
 
     url = (
         "https://ngw.devices.sberbank.ru:9443/"
@@ -323,7 +347,21 @@ def get_access_token():
 
     response.raise_for_status()
 
-    return response.json()["access_token"]
+    result = response.json()
+    return (
+        result["access_token"],
+        result.get("expires_at", time.time() + 1800),
+    )
+
+
+GIGACHAT_TOKEN_CACHE = AccessTokenCache(
+    _fetch_access_token,
+    refresh_margin_seconds=60,
+)
+
+
+def get_access_token():
+    return GIGACHAT_TOKEN_CACHE.get()
 
 
 # =========================================================
@@ -891,6 +929,29 @@ async def handle_message(
         )
     )
 
+    routing = route_message(
+        user_message,
+        existing_case,
+    )
+
+    if routing["intent"] == CONVERSATION:
+        try:
+            answer = await run_blocking(
+                ask_gigachat,
+                history,
+                None,
+            )
+            answer = guard_conversational_answer(answer)
+            save_message(client_id, "assistant", answer)
+            await update.message.reply_text(answer)
+        except Exception as e:
+            print(f"Ошибка GigaChat: {e}")
+            await update.message.reply_text(
+                "Извините, произошла техническая "
+                "ошибка. Попробуйте написать ещё раз."
+            )
+        return
+
     if existing_case:
 
         print(
@@ -913,10 +974,24 @@ async def handle_message(
 
     try:
 
-        case_analysis = analyze_case(
-            history,
-            existing_case
-        )
+        if routing["intent"] == SEARCH_REQUEST and existing_case:
+            case_analysis = {
+                "category": existing_case["category"],
+                "title": existing_case["title"],
+                "data": existing_case["data"],
+                "missing_data": existing_case["missing_data"],
+            }
+        else:
+            case_for_analysis = (
+                None
+                if routing["intent"] == NEW_CASE
+                else existing_case
+            )
+            case_analysis = await run_blocking(
+                analyze_case,
+                history,
+                case_for_analysis,
+            )
 
         print(
             "\n===== CASE ANALYSIS ====="
@@ -939,100 +1014,17 @@ async def handle_message(
                 "Анализ кейса должен вернуть словарь"
             )
 
-        category = case_analysis.get(
-            "category",
-            "other"
-        )
-
-        title = case_analysis.get(
-            "title",
-            "Новый запрос"
-        )
-
-        new_case_data = case_analysis.get(
-            "data",
-            {}
-        )
-
-        new_missing_data = (
-            case_analysis.get(
-                "missing_data",
-                []
-            )
-        )
-
-        if not isinstance(
-            new_case_data,
-            dict
-        ):
-
-            new_case_data = {}
-
-        if not isinstance(
-            new_missing_data,
-            list
-        ):
-
-            new_missing_data = []
-
-        # -------------------------------------------------
-        # Объединяем старые и новые данные
-        # -------------------------------------------------
-
-        old_data = (
-            existing_case.get("data", {})
-            if existing_case
-            else {}
-        )
-        case_data = merge_case_data(
-            old_data,
-            new_case_data,
-        )
-
-        # -------------------------------------------------
-        # Определяем обязательные поля
-        # -------------------------------------------------
-
-        if category == "housing":
-
-            missing_data = get_housing_missing_fields(
-                case_data
-            )
-
-        else:
-
-            missing_data = (
-                new_missing_data
-            )
-
-        # -------------------------------------------------
-        # Получаем или создаём кейс
-        # -------------------------------------------------
-
-        case_id = get_or_create_case(
+        persisted_case = persist_case_analysis(
             client_id,
-            category,
-            title
+            case_analysis,
+            routing,
+            existing_case,
         )
-
-        # -------------------------------------------------
-        # Статус
-        # -------------------------------------------------
-
-        case_status = get_case_status(
-            missing_data
-        )
-
-        # -------------------------------------------------
-        # Сохраняем кейс
-        # -------------------------------------------------
-
-        update_case(
-            case_id,
-            case_data,
-            missing_data,
-            case_status
-        )
+        case_id = persisted_case["id"]
+        category = persisted_case["category"]
+        case_data = persisted_case["data"]
+        missing_data = persisted_case["missing_data"]
+        case_status = persisted_case["status"]
 
         print(
             f"Кейс сохранён в базе: {case_id}"
@@ -1064,102 +1056,90 @@ async def handle_message(
 
             case_context = ""
 
+        if category == "housing" and missing_data:
+            question = build_housing_missing_question(missing_data)
+            save_message(client_id, "assistant", question)
+            await update.message.reply_text(question)
+            return
+
         # -------------------------------------------------
         # ЕСЛИ КЕЙС ГОТОВ — ПОДТВЕРЖДАЕМ
         # -------------------------------------------------
 
         if (
-            category == "housing"
-            and case_status == "ready_for_search"
+            should_start_search(
+                routing["intent"],
+                category,
+                case_status,
+            )
         ):
 
-            confirmation = (
-                build_search_confirmation(
-                    case_data
+            repeat_search = routing["intent"] == SEARCH_REQUEST
+            requested_result_limit = (
+                routing.get("requested_result_limit") or 5
+            )
+            confirmation = build_pre_search_message(
+                case_data,
+                repeat_search,
+                build_search_confirmation,
+            )
+
+            if confirmation:
+                print("\n===== SEARCH REQUEST =====")
+                print(confirmation)
+                print("==========================\n")
+                save_message(client_id, "assistant", confirmation)
+                await update.message.reply_text(confirmation)
+
+            set_case_status(case_id, "searching")
+
+            try:
+                (
+                    search_result,
+                    case_data,
+                    search_status,
+                ) = await execute_housing_search(
+                    case_data,
+                    repeat_search,
+                    requested_result_limit=requested_result_limit,
                 )
-            )
+            except Exception as e:
+                print(f"Ошибка поиска жилья: {e}")
+                set_case_status(case_id, "ready_for_search")
+                search_message = PROVIDER_ERROR_MESSAGE
+                save_message(client_id, "assistant", search_message)
+                await update.message.reply_text(search_message)
+                return
 
-            print(
-                "\n===== SEARCH REQUEST ====="
-            )
-
-            print(
-                confirmation
-            )
-
-            print(
-                "==========================\n"
-            )
-
-            save_message(
-                client_id,
-                "assistant",
-                confirmation
-            )
-
-            await update.message.reply_text(
-                confirmation
-            )
-
-            search_result = search_housing(
-                {
-                    "category": category,
-                    "data": case_data,
-                }
-            )
+            if search_result.get("status") == SEARCH_PROVIDER_ERROR:
+                set_case_status(case_id, "ready_for_search")
+                search_message = PROVIDER_ERROR_MESSAGE
+                save_message(client_id, "assistant", search_message)
+                await update.message.reply_text(search_message)
+                return
 
             results = search_result.get(
                 "results",
                 []
             )
 
+            shown_results = results[:requested_result_limit]
+            update_case(
+                case_id,
+                case_data,
+                missing_data,
+                search_status,
+            )
+
             if results:
-
-                lines = [
-                    "Нашёл первые подходящие варианты:\n"
-                ]
-
-                for index, item in enumerate(
-                    results[:5],
-                    start=1
-                ):
-                    name = item.get(
-                        "name",
-                        "Вариант жилья"
-                    )
-
-                    url = item.get(
-                        "url",
-                        ""
-                    )
-
-                    description = item.get(
-                        "description",
-                        ""
-                    )
-
-                    if len(description) > 250:
-                        description = (
-                            description[:250]
-                            + "..."
-                        )
-
-                    lines.append(
-                        f"{index}. {name}\n"
-                        f"{description}\n"
-                        f"{url}\n"
-                    )
-
-                search_message = "\n".join(
-                    lines
+                search_message = build_results_message(
+                    shown_results,
+                    repeat_search=repeat_search,
                 )
 
             else:
 
-                search_message = (
-                    "По вашему запросу пока не удалось "
-                    "найти подходящие варианты."
-                )
+                search_message = get_no_results_message(repeat_search)
 
             save_message(
                 client_id,
@@ -1187,10 +1167,12 @@ async def handle_message(
 
     try:
 
-        answer = ask_gigachat(
+        answer = await run_blocking(
+            ask_gigachat,
             history,
-            case_context
+            case_context,
         )
+        answer = guard_conversational_answer(answer)
 
         save_message(
             client_id,
