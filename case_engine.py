@@ -1,14 +1,6 @@
 
-import sqlite3
 import json
-from datetime import datetime
-
-
-DB_PATH = "phuketlife.db"
-
-
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+from database import get_connection
 
 
 def get_or_create_case(client_id, category, title):
@@ -103,6 +95,36 @@ def update_case(case_id, data, missing_data=None, status=None):
 
     conn.commit()
     conn.close()
+
+
+def merge_case_data(existing_data, new_data):
+    """Merge non-empty extracted values into persisted case data."""
+    merged = dict(existing_data) if isinstance(existing_data, dict) else {}
+    if not isinstance(new_data, dict):
+        return merged
+    for key, value in new_data.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def get_housing_missing_fields(case_data):
+    required_fields = (
+        "arrival_date",
+        "departure_date",
+        "people",
+        "budget",
+    )
+    data = case_data if isinstance(case_data, dict) else {}
+    return [
+        field
+        for field in required_fields
+        if data.get(field) in (None, "", [], {})
+    ]
+
+
+def get_case_status(missing_data):
+    return "active" if missing_data else "ready_for_search"
 
 
 def get_case(case_id):

@@ -2,11 +2,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import os
 import uuid
 import json
 import requests
-import sqlite3
 
 from telegram import Update
 from telegram.ext import (
@@ -23,20 +21,26 @@ from case_engine import (
     get_client_active_case,
     format_case_for_ai,
     close_active_case,
+    merge_case_data,
+    get_housing_missing_fields,
+    get_case_status,
 )
 from search_engine import search_housing
+from config import load_settings
+from database import (
+    init_db,
+    get_connection,
+    get_or_create_client as db_get_or_create_client,
+)
 
 
 # =========================================================
 # НАСТРОЙКИ
 # =========================================================
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GIGACHAT_API_KEY = os.environ["GIGACHAT_API_KEY"]
+SETTINGS = load_settings()
 
 MODEL = "GigaChat-2-Max"
-
-DB_NAME = "phuketlife.db"
 
 MAX_HISTORY = 20
 
@@ -189,10 +193,6 @@ Phuket Life помогает туристам и экспатам в Таила�
 # DATABASE
 # =========================================================
 
-def get_connection():
-    return sqlite3.connect(DB_NAME)
-
-
 def get_or_create_client(update: Update):
 
     user = update.effective_user
@@ -202,51 +202,12 @@ def get_or_create_client(update: Update):
     first_name = user.first_name
     last_name = user.last_name
 
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT id
-        FROM clients
-        WHERE telegram_id = ?
-        """,
-        (telegram_id,)
+    return db_get_or_create_client(
+        telegram_id,
+        username,
+        first_name,
+        last_name,
     )
-
-    client = cursor.fetchone()
-
-    if client:
-
-        client_id = client[0]
-
-    else:
-
-        cursor.execute(
-            """
-            INSERT INTO clients
-            (
-                telegram_id,
-                username,
-                first_name,
-                last_name
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                telegram_id,
-                username,
-                first_name,
-                last_name
-            )
-        )
-
-        client_id = cursor.lastrowid
-
-    connection.commit()
-    connection.close()
-
-    return client_id
 
 
 def save_message(client_id, role, content):
@@ -344,7 +305,7 @@ def get_access_token():
         "Accept": "application/json",
         "RqUID": str(uuid.uuid4()),
         "Authorization": (
-            f"Basic {GIGACHAT_API_KEY}"
+            f"Basic {SETTINGS.gigachat_api_key}"
         ),
     }
 
@@ -357,7 +318,7 @@ def get_access_token():
         headers=headers,
         data=data,
         timeout=30,
-        verify=False
+        verify=SETTINGS.gigachat_tls_verify
     )
 
     response.raise_for_status()
@@ -477,7 +438,7 @@ def ask_gigachat(
         headers=headers,
         json=data,
         timeout=60,
-        verify=False
+        verify=SETTINGS.gigachat_tls_verify
     )
 
     if not response.ok:
@@ -663,7 +624,7 @@ other
         headers=headers,
         json=data,
         timeout=60,
-        verify=False
+        verify=SETTINGS.gigachat_tls_verify
     )
 
     if not response.ok:
@@ -1018,36 +979,15 @@ async def handle_message(
         # Объединяем старые и новые данные
         # -------------------------------------------------
 
-        case_data = {}
-
-        if existing_case:
-
-            old_data = existing_case.get(
-                "data",
-                {}
-            )
-
-            if isinstance(
-                old_data,
-                dict
-            ):
-
-                case_data.update(
-                    old_data
-                )
-
-        for key, value in (
-            new_case_data.items()
-        ):
-
-            if value not in (
-                None,
-                "",
-                [],
-                {}
-            ):
-
-                case_data[key] = value
+        old_data = (
+            existing_case.get("data", {})
+            if existing_case
+            else {}
+        )
+        case_data = merge_case_data(
+            old_data,
+            new_case_data,
+        )
 
         # -------------------------------------------------
         # Определяем обязательные поля
@@ -1055,31 +995,9 @@ async def handle_message(
 
         if category == "housing":
 
-            required_fields = [
-                "arrival_date",
-                "departure_date",
-                "people",
-                "budget"
-            ]
-
-            missing_data = []
-
-            for field in required_fields:
-
-                value = case_data.get(
-                    field
-                )
-
-                if value in (
-                    None,
-                    "",
-                    [],
-                    {}
-                ):
-
-                    missing_data.append(
-                        field
-                    )
+            missing_data = get_housing_missing_fields(
+                case_data
+            )
 
         else:
 
@@ -1101,15 +1019,9 @@ async def handle_message(
         # Статус
         # -------------------------------------------------
 
-        if missing_data:
-
-            case_status = "active"
-
-        else:
-
-            case_status = (
-                "ready_for_search"
-            )
+        case_status = get_case_status(
+            missing_data
+        )
 
         # -------------------------------------------------
         # Сохраняем кейс
@@ -1308,11 +1220,13 @@ async def handle_message(
 
 def main():
 
+    init_db()
+
     app = (
         Application
         .builder()
         .token(
-            TELEGRAM_BOT_TOKEN
+            SETTINGS.telegram_bot_token
         )
         .build()
     )
