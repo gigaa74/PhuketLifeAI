@@ -15,6 +15,7 @@ class Settings:
     yandex_folder_id: str
     gigachat_ca_bundle: str | None = None
     telegram_admin_user_id: int | None = None
+    partner_handoff_mode: str = "review"
 
     @property
     def gigachat_tls_verify(self):
@@ -52,6 +53,12 @@ def load_settings(environ=None):
             "TELEGRAM_ADMIN_USER_ID должен быть целым числом"
         ) from error
 
+    handoff_mode = values.get("PARTNER_HANDOFF_MODE", "review").strip().lower()
+    if handoff_mode not in ("review", "hybrid"):
+        raise ConfigurationError(
+            "PARTNER_HANDOFF_MODE должен быть review или hybrid"
+        )
+
     return Settings(
         telegram_bot_token=values["TELEGRAM_BOT_TOKEN"].strip(),
         gigachat_api_key=values["GIGACHAT_API_KEY"].strip(),
@@ -59,4 +66,5 @@ def load_settings(environ=None):
         yandex_folder_id=values["YANDEX_FOLDER_ID"].strip(),
         gigachat_ca_bundle=ca_bundle,
         telegram_admin_user_id=admin_user_id,
+        partner_handoff_mode=handoff_mode,
     )

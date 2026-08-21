@@ -159,11 +159,63 @@ def _migration_004_partner_network(connection):
     )
 
 
+def _migration_005_partner_handoff(connection):
+    partner_columns = _column_names(connection, "partners")
+    if "auto_handoff_enabled" not in partner_columns:
+        connection.execute(
+            "ALTER TABLE partners ADD COLUMN auto_handoff_enabled INTEGER DEFAULT 0"
+        )
+    request_columns = _column_names(connection, "partner_requests")
+    if "partner_response_metadata" not in request_columns:
+        connection.execute(
+            "ALTER TABLE partner_requests ADD COLUMN partner_response_metadata TEXT"
+        )
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS partner_offers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_request_id INTEGER NOT NULL UNIQUE,
+            case_id INTEGER NOT NULL,
+            partner_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'needs_review',
+            handoff_decision TEXT NOT NULL DEFAULT 'review_required',
+            raw_partner_response TEXT NOT NULL,
+            offer_title TEXT,
+            offer_description TEXT,
+            price_text TEXT,
+            currency TEXT,
+            url TEXT,
+            conditions TEXT,
+            validation_reasons TEXT NOT NULL DEFAULT '[]',
+            validation_score REAL NOT NULL DEFAULT 0,
+            telegram_metadata TEXT,
+            client_telegram_message_id INTEGER,
+            error_code TEXT,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            validated_at TIMESTAMP,
+            sent_at TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (partner_request_id) REFERENCES partner_requests(id),
+            FOREIGN KEY (case_id) REFERENCES cases(id),
+            FOREIGN KEY (partner_id) REFERENCES partners(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_partner_offers_case_id
+            ON partner_offers(case_id, id);
+        CREATE INDEX IF NOT EXISTS idx_partner_offers_status
+            ON partner_offers(status, id);
+        CREATE INDEX IF NOT EXISTS idx_partner_offers_partner_id
+            ON partner_offers(partner_id, id);
+        """
+    )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
     (3, _migration_003_indexes),
     (4, _migration_004_partner_network),
+    (5, _migration_005_partner_handoff),
 )
 
 

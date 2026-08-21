@@ -189,6 +189,24 @@ def set_partner_status(partner_id, status, db_path=None):
     return get_partner(partner_id, db_path)
 
 
+def set_partner_auto_handoff(partner_id, enabled, db_path=None):
+    connection = get_connection(db_path)
+    try:
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE partners SET auto_handoff_enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (int(bool(enabled)), _now(), partner_id),
+            )
+        if not cursor.rowcount:
+            raise PartnerUnavailableError("Партнёр не найден")
+    finally:
+        connection.close()
+    return get_partner(partner_id, db_path)
+
+
 def create_partner_invite(partner_id, db_path=None):
     token = secrets.token_urlsafe(24)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -418,6 +436,7 @@ async def send_case_to_partner(case_id, partner_id, telegram_sender, db_path=Non
 
 def record_partner_reply(
     telegram_user_id, reply_to_message_id, response_text, db_path=None,
+    response_metadata=None,
 ):
     connection = get_connection(db_path)
     connection.row_factory = sqlite3.Row
@@ -446,10 +465,17 @@ def record_partner_reply(
             connection.execute(
                 """
                 UPDATE partner_requests
-                SET status = ?, partner_response = ?, responded_at = ?, updated_at = ?
+                SET status = ?, partner_response = ?, partner_response_metadata = ?,
+                    responded_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, str(response_text or ""), _now(), _now(), row["id"]),
+                (
+                    status,
+                    str(response_text or ""),
+                    json.dumps(response_metadata, ensure_ascii=False)
+                    if response_metadata else None,
+                    _now(), _now(), row["id"],
+                ),
             )
         return get_partner_request(row["id"], db_path)
     finally:

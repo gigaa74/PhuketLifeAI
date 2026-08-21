@@ -52,6 +52,17 @@ class TruthfulnessTests(unittest.TestCase):
                     guard_conversational_answer(generated), TRUTHFUL_FALLBACK
                 )
 
+    def test_conversational_model_cannot_invent_client_handoff(self):
+        for generated in (
+            "Мы отправили клиенту предложение.",
+            "Вариант проверен и доступен.",
+            "Вариант подтверждён партнёром.",
+        ):
+            with self.subTest(generated=generated):
+                self.assertEqual(
+                    guard_conversational_answer(generated), TRUTHFUL_FALLBACK
+                )
+
     def test_error_and_no_results_do_not_promise_background_work(self):
         combined = (
             INITIAL_NO_RESULTS_MESSAGE

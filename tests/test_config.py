@@ -40,6 +40,19 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(settings.telegram_admin_user_id, 123456)
 
+    def test_partner_handoff_defaults_to_review_and_accepts_hybrid(self):
+        base = {
+            "TELEGRAM_BOT_TOKEN": "telegram-secret",
+            "GIGACHAT_API_KEY": "gigachat-secret",
+            "YANDEX_SEARCH_API_KEY": "yandex-secret",
+            "YANDEX_FOLDER_ID": "folder-id",
+        }
+        self.assertEqual(load_settings(base).partner_handoff_mode, "review")
+        self.assertEqual(
+            load_settings({**base, "PARTNER_HANDOFF_MODE": "hybrid"}).partner_handoff_mode,
+            "hybrid",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

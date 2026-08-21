@@ -7,10 +7,11 @@ import json
 import time
 import requests
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -32,8 +33,44 @@ from partner_network import (
     onboard_partner,
     record_partner_reply,
     send_case_to_partner,
+    set_partner_auto_handoff,
     set_partner_status,
     update_partner,
+)
+from partner_handoff import (
+    DuplicateOfferSendError,
+    OfferHandoffError,
+    OfferTelegramError,
+    create_offer_from_partner_response,
+    format_client_offer,
+    get_offer,
+    get_offer_context,
+    list_offers,
+    reject_offer,
+    send_offer_to_client,
+)
+from admin_case import (
+    AdminCaseNotFoundError,
+    format_offer_review_card,
+    get_admin_case_snapshot,
+    list_admin_cases,
+)
+from admin_i18n import (
+    format_partner_request_status_ru,
+    format_partner_status_ru,
+    format_service_category_ru,
+)
+from admin_ui import (
+    admin_panel_buttons,
+    can_access_admin_panel,
+    execute_offer_reject,
+    execute_offer_send,
+    execute_partner_auto_toggle,
+    execute_partner_send,
+    format_offer_list_item,
+    format_partner_card,
+    offer_action_buttons,
+    partner_action_buttons,
 )
 
 from case_engine import (
@@ -858,6 +895,24 @@ async def _require_admin(update):
     return False
 
 
+def _admin_keyboard(button_rows):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(text, callback_data=data) for text, data in row]
+            for row in button_rows
+        ]
+    )
+
+
+async def admin_command(update, context):
+    if not await _require_admin(update):
+        return
+    await update.message.reply_text(
+        "Панель администратора Phuket Life",
+        reply_markup=_admin_keyboard(admin_panel_buttons()),
+    )
+
+
 async def partners_command(update, context):
     if not await _require_admin(update):
         return
@@ -869,8 +924,9 @@ async def partners_command(update, context):
     for partner in partners:
         connected = "Telegram подключён" if partner.get("telegram_user_id") else "не подключён"
         lines.append(
-            f"#{partner['id']} {partner['name']} — {partner['status']}\n"
-            f"Услуги: {', '.join(partner['services']) or '—'}; {connected}"
+            f"Партнёр №{partner['id']} — {partner['name']}\n"
+            f"Статус: {format_partner_status_ru(partner['status'])}\n"
+            f"Услуги: {', '.join(format_service_category_ru(item) for item in partner['services']) or '—'}; {connected}"
         )
     await update.message.reply_text("\n\n".join(lines))
 
@@ -885,8 +941,10 @@ async def partner_requests_command(update, context):
     lines = ["📨 Последние запросы партнёрам"]
     for item in requests_list:
         lines.append(
-            f"#{item['id']} case #{item['case_id']} → "
-            f"{item['partner_name']} [{item['status']}]"
+            f"Запрос №{item['id']} · кейс №{item['case_id']} → "
+            f"{item['partner_name']}\n"
+            f"Статус: {format_partner_request_status_ru(item['status'])}\n"
+            f"{get_admin_case_snapshot(item['case_id'])}"
         )
     await update.message.reply_text("\n".join(lines))
 
@@ -907,8 +965,11 @@ async def case_partners_command(update, context):
         await update.message.reply_text("Подходящих активных партнёров не найдено.")
         return
     await update.message.reply_text(
-        "\n".join(
-            f"#{partner['id']} {partner['name']} — {', '.join(partner['services'])}"
+        get_admin_case_snapshot(case["id"])
+        + "\n\nПодходящие партнёры:\n"
+        + "\n".join(
+            f"Партнёр №{partner['id']} — {partner['name']} — "
+            f"{', '.join(format_service_category_ru(item) for item in partner['services'])}"
             for partner in partners
         )
     )
@@ -924,7 +985,7 @@ async def send_partner_command(update, context):
         return
     case_id, partner_id = map(int, context.args)
     try:
-        request = await send_case_to_partner(
+        request = await execute_partner_send(
             case_id, partner_id, context.bot.send_message
         )
     except DuplicatePartnerRequestError:
@@ -934,14 +995,14 @@ async def send_partner_command(update, context):
         return
     except PartnerTelegramError:
         await update.message.reply_text(
-            "Telegram не подтвердил отправку. Запрос отмечен как failed."
+            "Telegram не подтвердил отправку. Запрос отмечен как неотправленный."
         )
         return
     except PartnerNetworkError as error:
         await update.message.reply_text(str(error))
         return
     await update.message.reply_text(
-        f"Запрос #{request['id']} подтверждён Telegram и отправлен партнёру."
+        f"Запрос №{request['id']} отправлен партнёру."
     )
 
 
@@ -966,7 +1027,7 @@ async def partner_create_command(update, context):
     bot_username = context.bot.username
     link = f"https://t.me/{bot_username}?start=partner_{token}"
     await update.message.reply_text(
-        f"Создан партнёр #{partner['id']} {partner['name']} (candidate).\n"
+        f"Создан партнёр №{partner['id']} — {partner['name']}.\n"
         f"Одноразовая ссылка подключения:\n{link}"
     )
 
@@ -985,7 +1046,7 @@ async def partner_status_command(update, context):
         await update.message.reply_text(str(error))
         return
     await update.message.reply_text(
-        f"Партнёр #{partner['id']}: статус {partner['status']}."
+        f"Партнёр №{partner['id']}: статус — {format_partner_status_ru(partner['status'])}."
     )
 
 
@@ -1012,38 +1073,404 @@ async def partner_update_command(update, context):
     await update.message.reply_text(f"Партнёр #{partner['id']} обновлён.")
 
 
+async def partner_autohandoff_command(update, context):
+    if not await _require_admin(update):
+        return
+    if (
+        len(context.args) != 2
+        or not context.args[0].isdigit()
+        or context.args[1].casefold() not in ("on", "off")
+    ):
+        await update.message.reply_text(
+            "Использование: /partner_autohandoff <partner_id> on|off"
+        )
+        return
+    try:
+        partner = execute_partner_auto_toggle(
+            int(context.args[0]), context.args[1].casefold() == "on"
+        )
+    except PartnerNetworkError as error:
+        await update.message.reply_text(str(error))
+        return
+    state = "включён" if partner["auto_handoff_enabled"] else "выключен"
+    await update.message.reply_text(
+        f"Автоотправка для партнёра №{partner['id']} {state}."
+    )
+
+
+async def offers_command(update, context):
+    if not await _require_admin(update):
+        return
+    offers = list_offers()
+    if not offers:
+        await update.message.reply_text("Предложений партнёров пока нет.")
+        return
+    await update.message.reply_text(
+        "\n\n".join(format_offer_list_item(offer) for offer in offers)
+    )
+
+
+async def case_command(update, context):
+    if not await _require_admin(update):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /case <case_id>")
+        return
+    try:
+        snapshot = get_admin_case_snapshot(int(context.args[0]))
+    except AdminCaseNotFoundError:
+        await update.message.reply_text("Кейс не найден.")
+        return
+    await update.message.reply_text(snapshot)
+
+
+async def offer_command(update, context):
+    if not await _require_admin(update):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /offer <offer_id>")
+        return
+    offer = get_offer(int(context.args[0]))
+    if not offer:
+        await update.message.reply_text("Предложение не найдено.")
+        return
+    context_data = get_offer_context(offer["id"])
+    partner = get_partner(offer["partner_id"])
+    client_message = format_client_offer(offer, context_data)
+    await update.message.reply_text(
+        format_offer_review_card(
+            offer,
+            partner["name"],
+            get_admin_case_snapshot(offer["case_id"]),
+            client_message if offer.get("status") == "sent_to_client" else None,
+        )
+        + ("" if offer.get("status") == "sent_to_client"
+           else "\n\nКлиент увидит:\n" + client_message),
+        reply_markup=_admin_keyboard(
+            offer_action_buttons(offer["id"], offer["case_id"], offer["partner_id"])
+        ),
+    )
+
+
+async def offer_send_command(update, context):
+    if not await _require_admin(update):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /offer_send <offer_id>")
+        return
+    try:
+        offer = await execute_offer_send(
+            int(context.args[0]), context.bot.send_message
+        )
+    except DuplicateOfferSendError:
+        await update.message.reply_text("Предложение уже отправлено клиенту.")
+        return
+    except OfferTelegramError:
+        await update.message.reply_text(
+            "Telegram не подтвердил отправку клиенту. Предложение не отмечено как отправленное."
+        )
+        return
+    except OfferHandoffError as error:
+        await update.message.reply_text(str(error))
+        return
+    await update.message.reply_text(
+        f"Предложение №{offer['id']} отправлено клиенту."
+    )
+
+
+async def offer_reject_command(update, context):
+    if not await _require_admin(update):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /offer_reject <offer_id>")
+        return
+    try:
+        offer = execute_offer_reject(int(context.args[0]))
+    except OfferHandoffError as error:
+        await update.message.reply_text(str(error))
+        return
+    await update.message.reply_text(f"Предложение №{offer['id']} отклонено.")
+
+
+async def _show_admin_panel(query):
+    await query.edit_message_text(
+        "Панель администратора Phuket Life",
+        reply_markup=_admin_keyboard(admin_panel_buttons()),
+    )
+
+
+async def _show_admin_cases(query):
+    cases = list_admin_cases()
+    if not cases:
+        await query.edit_message_text(
+            "Кейсов пока нет.",
+            reply_markup=_admin_keyboard([[('⬅️ В панель', 'admin:panel')]]),
+        )
+        return
+    buttons = [
+        [(f"Кейс №{case['id']} — {format_service_category_ru(case['category'])}",
+          f"case:view:{case['id']}")]
+        for case in cases
+    ]
+    buttons.append([("⬅️ В панель", "admin:panel")])
+    await query.edit_message_text(
+        "🗂 Последние кейсы",
+        reply_markup=_admin_keyboard(buttons),
+    )
+
+
+async def _show_admin_offers(query):
+    offers = list_offers()
+    if not offers:
+        await query.edit_message_text(
+            "Предложений партнёров пока нет.",
+            reply_markup=_admin_keyboard([[('⬅️ В панель', 'admin:panel')]]),
+        )
+        return
+    text = "📋 Предложения\n\n" + "\n\n".join(
+        format_offer_list_item(offer) for offer in offers
+    )
+    buttons = [[(f"Открыть предложение №{offer['id']}", f"offer:view:{offer['id']}")]
+               for offer in offers]
+    buttons.append([("⬅️ В панель", "admin:panel")])
+    await query.edit_message_text(text, reply_markup=_admin_keyboard(buttons))
+
+
+async def _show_offer(query, offer_id):
+    offer = get_offer(offer_id)
+    if not offer:
+        await query.edit_message_text("Предложение не найдено.")
+        return
+    partner = get_partner(offer["partner_id"])
+    context_data = get_offer_context(offer_id)
+    client_message = format_client_offer(offer, context_data)
+    text = (
+        format_offer_review_card(
+            offer,
+            partner["name"],
+            get_admin_case_snapshot(offer["case_id"]),
+            client_message if offer.get("status") == "sent_to_client" else None,
+        )
+        + ("" if offer.get("status") == "sent_to_client"
+           else "\n\nКлиент увидит:\n" + client_message)
+    )
+    await query.edit_message_text(
+        text,
+        reply_markup=_admin_keyboard(
+            offer_action_buttons(offer_id, offer["case_id"], offer["partner_id"])
+        ),
+    )
+
+
+async def _show_partner(query, partner_id, case_id=None):
+    partner = get_partner(partner_id)
+    if not partner:
+        await query.edit_message_text("Партнёр не найден.")
+        return
+    await query.edit_message_text(
+        format_partner_card(partner),
+        reply_markup=_admin_keyboard(
+            partner_action_buttons(
+                partner_id, partner.get("auto_handoff_enabled"), case_id
+            )
+        ),
+    )
+
+
+async def admin_callback_handler(update, context):
+    query = update.callback_query
+    user_id = update.effective_user.id if update.effective_user else None
+    if not can_access_admin_panel(SETTINGS.telegram_admin_user_id, user_id):
+        await query.answer("Недостаточно прав.", show_alert=True)
+        return
+    await query.answer()
+    parts = (query.data or "").split(":")
+    try:
+        if query.data == "admin:panel":
+            await _show_admin_panel(query)
+        elif query.data == "admin:cases":
+            await _show_admin_cases(query)
+        elif query.data == "admin:offers":
+            await _show_admin_offers(query)
+        elif query.data == "admin:partners":
+            partners = list_partners()
+            buttons = [[(f"Партнёр №{p['id']} — {p['name']}", f"partner:view:{p['id']}")]
+                       for p in partners]
+            buttons.append([("⬅️ В панель", "admin:panel")])
+            await query.edit_message_text(
+                "🤝 Партнёры" if partners else "Партнёры пока не добавлены.",
+                reply_markup=_admin_keyboard(buttons),
+            )
+        elif query.data == "admin:requests":
+            requests_list = list_partner_requests()
+            text = "📩 Запросы партнёрам"
+            if requests_list:
+                text += "\n\n" + "\n\n".join(
+                    f"Запрос №{item['id']} · кейс №{item['case_id']}\n"
+                    f"Партнёр: {item['partner_name']}\n"
+                    f"Статус: {format_partner_request_status_ru(item['status'])}"
+                    for item in requests_list
+                )
+            else:
+                text = "Запросов партнёрам пока нет."
+            await query.edit_message_text(
+                text,
+                reply_markup=_admin_keyboard([[('⬅️ В панель', 'admin:panel')]]),
+            )
+        elif query.data == "admin:settings":
+            mode = {
+                "review": "Ручная проверка",
+                "hybrid": "Гибридный режим",
+            }.get(SETTINGS.partner_handoff_mode, "Неизвестно")
+            await query.edit_message_text(
+                f"⚙️ Настройки\n\nРежим обработки предложений: {mode}",
+                reply_markup=_admin_keyboard([[('⬅️ В панель', 'admin:panel')]]),
+            )
+        elif parts[:2] == ["case", "view"]:
+            case_id = int(parts[2])
+            await query.edit_message_text(
+                get_admin_case_snapshot(case_id),
+                reply_markup=_admin_keyboard([
+                    [("🤝 Подобрать партнёров", f"case:partners:{case_id}")],
+                    [("⬅️ К кейсам", "admin:cases")],
+                ]),
+            )
+        elif parts[:2] == ["case", "partners"]:
+            case_id = int(parts[2])
+            case = get_case_for_partner(case_id)
+            partners = find_partners_for_case(case)
+            buttons = [[
+                (f"Партнёр №{partner['id']} — {partner['name']}",
+                 f"partner:view:{partner['id']}:{case_id}")
+            ] for partner in partners]
+            buttons.append([("⬅️ К кейсу", f"case:view:{case_id}")])
+            await query.edit_message_text(
+                "Подходящие партнёры" if partners
+                else "Подходящих активных партнёров не найдено.",
+                reply_markup=_admin_keyboard(buttons),
+            )
+        elif parts[:2] == ["offer", "view"]:
+            await _show_offer(query, int(parts[2]))
+        elif parts[:2] == ["offer", "send"]:
+            offer = await execute_offer_send(int(parts[2]), context.bot.send_message)
+            await query.edit_message_text(
+                f"Предложение №{offer['id']} отправлено клиенту.",
+                reply_markup=_admin_keyboard([[('⬅️ К предложениям', 'admin:offers')]]),
+            )
+        elif parts[:2] == ["offer", "reject"]:
+            offer = execute_offer_reject(int(parts[2]))
+            await query.edit_message_text(
+                f"Предложение №{offer['id']} отклонено.",
+                reply_markup=_admin_keyboard([[('⬅️ К предложениям', 'admin:offers')]]),
+            )
+        elif parts[:2] == ["partner", "view"]:
+            await _show_partner(
+                query, int(parts[2]), int(parts[3]) if len(parts) > 3 else None
+            )
+        elif parts[:2] == ["partner", "auto"]:
+            partner = execute_partner_auto_toggle(int(parts[2]), parts[3] == "on")
+            await _show_partner(query, partner["id"])
+        elif parts[:2] == ["partner", "send"]:
+            request = await execute_partner_send(
+                int(parts[2]), int(parts[3]), context.bot.send_message
+            )
+            await query.edit_message_text(
+                f"Запрос №{request['id']} отправлен партнёру.",
+                reply_markup=_admin_keyboard([[('⬅️ В панель', 'admin:panel')]]),
+            )
+    except AdminCaseNotFoundError:
+        await query.edit_message_text("Кейс не найден.")
+    except DuplicateOfferSendError:
+        await query.edit_message_text("Предложение уже отправлено клиенту.")
+    except DuplicatePartnerRequestError:
+        await query.edit_message_text("Активный запрос этому партнёру уже существует.")
+    except (OfferTelegramError, PartnerTelegramError):
+        await query.edit_message_text("Telegram не подтвердил отправку. Попробуйте ещё раз.")
+    except (OfferHandoffError, PartnerNetworkError) as error:
+        await query.edit_message_text(f"Не удалось выполнить действие: {error}")
+
+
 async def partner_reply_handler(update, context):
     message = update.message
-    if not message or not message.reply_to_message or not message.text:
+    if not message or not message.reply_to_message:
         return
+    response_text = message.text or message.caption or ""
+    metadata = {
+        "telegram_message_id": message.message_id,
+        "has_media": bool(message.photo or message.video or message.document),
+        "media_type": (
+            "photo" if message.photo else
+            "video" if message.video else
+            "document" if message.document else None
+        ),
+    }
     request = record_partner_reply(
         update.effective_user.id,
         message.reply_to_message.message_id,
-        message.text,
+        response_text,
+        response_metadata=metadata,
     )
     if not request:
         return
-    await message.reply_text("Ответ сохранён и передан администратору Phuket Life.")
+    await message.reply_text("Ответ сохранён в Phuket Life.")
     admin_id = SETTINGS.telegram_admin_user_id
-    if admin_id:
-        partner = get_partner(request["partner_id"])
+    partner = get_partner(request["partner_id"])
+    offer = None
+    auto_send_succeeded = False
+    auto_send_failed = False
+    if request["status"] == "responded":
         try:
+            offer = create_offer_from_partner_response(
+                request["id"], SETTINGS.partner_handoff_mode
+            )
+            if offer and offer["handoff_decision"] == "auto_send":
+                try:
+                    offer = await send_offer_to_client(
+                        offer["id"], context.bot.send_message
+                    )
+                    auto_send_succeeded = True
+                except OfferTelegramError:
+                    auto_send_failed = True
+        except OfferHandoffError:
+            offer = None
+    if admin_id:
+        if auto_send_succeeded:
+            notification = (
+                "✅ Новый ответ партнёра\n\n"
+                f"Предложение №{offer['id']} проверено и отправлено клиенту."
+            )
+        elif auto_send_failed:
+            notification = (
+                "❌ Не удалось отправить предложение клиенту\n\n"
+                f"Предложение №{offer['id']} не отмечено как отправленное."
+            )
+        elif offer:
+            notification = format_offer_review_card(
+                offer,
+                partner["name"],
+                get_admin_case_snapshot(offer["case_id"]),
+            )
+        else:
+            notification = (
+                "🤝 Ответ партнёра\n\n"
+                f"Запрос №{request['id']} · кейс №{request['case_id']}\n"
+                f"Партнёр: {partner['name']}\n"
+                f"Статус: {format_partner_request_status_ru(request['status'])}\n\n"
+                f"Ответ:\n{request['partner_response']}"
+            )
+        try:
+            reply_markup = None
+            if offer and not auto_send_succeeded:
+                reply_markup = _admin_keyboard(
+                    offer_action_buttons(
+                        offer["id"], offer["case_id"], offer["partner_id"]
+                    )
+                )
             await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    "🤝 Ответ партнёра\n\n"
-                    f"Запрос #{request['id']} / case #{request['case_id']}\n"
-                    f"Партнёр: {partner['name']}\n"
-                    f"Категория: {request['service_category']}\n"
-                    f"Статус: {request['status']}\n\n"
-                    f"Ответ:\n{request['partner_response']}"
-                ),
+                chat_id=admin_id, text=notification, reply_markup=reply_markup
             )
         except Exception as error:
-            print(
-                "[PARTNER] Не удалось уведомить администратора: "
-                f"{type(error).__name__}"
-            )
+            print("[PARTNER] Admin notification failed: " + type(error).__name__)
     raise ApplicationHandlerStop
 
 
@@ -1463,6 +1890,7 @@ def main():
     )
 
     for command, callback in (
+        ("admin", admin_command),
         ("partners", partners_command),
         ("partner_requests", partner_requests_command),
         ("case_partners", case_partners_command),
@@ -1470,12 +1898,25 @@ def main():
         ("partner_create", partner_create_command),
         ("partner_status", partner_status_command),
         ("partner_update", partner_update_command),
+        ("partner_autohandoff", partner_autohandoff_command),
+        ("offers", offers_command),
+        ("case", case_command),
+        ("offer", offer_command),
+        ("offer_send", offer_send_command),
+        ("offer_reject", offer_reject_command),
     ):
         app.add_handler(CommandHandler(command, callback))
 
     app.add_handler(
+        CallbackQueryHandler(
+            admin_callback_handler,
+            pattern=r"^(admin|case|offer|partner):",
+        )
+    )
+
+    app.add_handler(
         MessageHandler(
-            filters.TEXT & filters.REPLY & ~filters.COMMAND,
+            filters.REPLY & ~filters.COMMAND,
             partner_reply_handler,
         ),
         group=-1,
