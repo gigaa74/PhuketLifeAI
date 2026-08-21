@@ -143,6 +143,34 @@ class NewHousingCaseFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("бюджет", question)
         self.assertEqual(persisted["status"], "active")
 
+    def test_explicit_second_housing_request_creates_separate_case(self):
+        first = persist_case_analysis(
+            self.client_id,
+            FULL_ANALYSIS,
+            {"intent": "new_case", "category": "housing"},
+            None,
+        )
+        stored_first = case_engine.get_case(first["id"])
+        second = persist_case_analysis(
+            self.client_id,
+            {
+                "category": "housing",
+                "title": "Отдельное жильё для друзей",
+                "data": {"people": "2"},
+                "missing_data": [],
+            },
+            {
+                "intent": "new_case",
+                "category": "housing",
+                "force_new_case": True,
+            },
+            stored_first,
+        )
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(case_engine.get_case(first["id"])["status"], "cancelled")
+        self.assertNotIn("location", second["data"])
+        self.assertNotIn("budget", second["data"])
+
 
 if __name__ == "__main__":
     unittest.main()

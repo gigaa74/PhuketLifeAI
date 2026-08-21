@@ -18,6 +18,7 @@ CONVERSATION_PHRASES = {
     "благодарю",
     "как дела",
     "как дела?",
+    "хай",
 }
 
 SEARCH_PHRASES = (
@@ -88,6 +89,8 @@ HOUSING_INTENT_MARKERS = (
     "снять квартир",
     "снять жиль",
     "хотим снять",
+    "хочу жиль",
+    "хочу снять жиль",
     "арендовать квартир",
     "арендовать жиль",
 )
@@ -230,7 +233,15 @@ def route_message(text, existing_case=None):
     return {"intent": CONVERSATION, "category": None}
 
 
-def should_start_search(intent, category, status):
+def should_start_search(
+    intent,
+    category,
+    status,
+    current_case_relevant=True,
+    continuity_resolved=True,
+):
+    if not current_case_relevant or not continuity_resolved:
+        return False
     if category != "housing" or status != "ready_for_search":
         return False
     return intent in (CASE_UPDATE, SEARCH_REQUEST, NEW_CASE)

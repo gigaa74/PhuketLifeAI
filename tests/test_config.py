@@ -53,6 +53,19 @@ class ConfigTests(unittest.TestCase):
             "hybrid",
         )
 
+    def test_gigachat_timeout_is_configurable_and_positive(self):
+        base = {
+            "TELEGRAM_BOT_TOKEN": "telegram-secret",
+            "GIGACHAT_API_KEY": "gigachat-secret",
+            "YANDEX_SEARCH_API_KEY": "yandex-secret",
+            "YANDEX_FOLDER_ID": "folder-id",
+        }
+        self.assertEqual(load_settings(base).gigachat_timeout_seconds, 30.0)
+        configured = load_settings({**base, "GIGACHAT_TIMEOUT_SECONDS": "12.5"})
+        self.assertEqual(configured.gigachat_timeout_seconds, 12.5)
+        with self.assertRaises(ConfigurationError):
+            load_settings({**base, "GIGACHAT_TIMEOUT_SECONDS": "0"})
+
 
 if __name__ == "__main__":
     unittest.main()

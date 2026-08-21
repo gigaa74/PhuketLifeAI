@@ -1,6 +1,10 @@
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from geo_relevance import (
+    canonicalize_known_property_url,
+    result_has_phuket_geo_evidence,
+)
 from search_presentation import CONCRETE_PROPERTY, LISTING_PAGE
 
 
@@ -468,13 +472,13 @@ def build_concrete_search_queries(search_request):
 
     queries = [
         f"{context} {housing_type} rent{pet}",
-        f"{location} Phuket condo rent specific property{pet}",
-        f"{location} Phuket hotel Booking{pet}",
+        f"{place} condo rent specific property{pet}",
+        f"{place} hotel Booking{pet}",
         f"site:booking.com/hotel {context}{pet}",
         f"site:airbnb.com/rooms {context}{pet}",
-        f"site:fazwaz.com property rent {location} Phuket{pet}",
-        f"site:thailand-property.com property {location} Phuket rent{pet}",
-        f"{location} Пхукет аренда конкретные апартаменты{pet}",
+        f"site:fazwaz.com property rent {place}{pet}",
+        f"site:thailand-property.com property {place} rent{pet}",
+        f"{place} аренда конкретные апартаменты{pet}",
     ]
     return list(dict.fromkeys(" ".join(query.split()) for query in queries))
 
@@ -498,10 +502,10 @@ def normalize_result(
     ):
         return None
 
-    url = result.get(
+    url = canonicalize_known_property_url(result.get(
         "url",
         "",
-    )
+    ))
 
     domain = result.get(
         "domain",
@@ -903,7 +907,7 @@ class HousingSearchEngine:
         provider_errors = []
         successful_providers = 0
         excluded_urls = {
-            normalize_result_identifier(url)
+            normalize_result_identifier(canonicalize_known_property_url(url))
             for url in search_request.get("excluded_urls", [])
             if url
         }
@@ -925,6 +929,11 @@ class HousingSearchEngine:
                     )
 
                     if normalized:
+                        if not result_has_phuket_geo_evidence(
+                            normalized,
+                            search_request.get("location"),
+                        ):
+                            continue
                         identifier = normalize_result_identifier(
                             normalized.get("url")
                         )

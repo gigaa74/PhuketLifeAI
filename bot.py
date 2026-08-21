@@ -85,7 +85,6 @@ from message_router import (
     CONVERSATION,
     NEW_CASE,
     SEARCH_REQUEST,
-    route_message,
     should_start_search,
 )
 from token_cache import AccessTokenCache
@@ -94,14 +93,34 @@ from housing_flow import execute_housing_search
 from housing_flow import build_housing_missing_question
 from case_flow import persist_case_analysis
 from truthfulness import (
+    GENERATION_DELAY_MESSAGE,
     PROVIDER_ERROR_MESSAGE,
     get_no_results_message,
-    guard_conversational_answer,
+    guard_client_voice,
 )
 from search_presentation import (
     build_pre_search_message,
     build_results_message,
 )
+from conversation_policy import (
+    CLARIFY_CONTINUITY,
+    apply_case_continuity,
+    build_continuity_question,
+    guard_policy_answer,
+    plan_response,
+    pure_greeting_response,
+    route_with_conversation_policy,
+    should_use_conversation_flow,
+)
+from conversation_prompts import build_conversation_policy_prompt
+from gigachat_provider import GigaChatGenerationError, generate_text
+from answer_source import (
+    PROVIDER_SEARCH,
+    TRUSTED_REFERENCE,
+    format_current_source_requirement,
+    select_answer_source,
+)
+from reference_formatter import format_reference_answer
 from config import load_settings
 from database import (
     init_db,
@@ -465,25 +484,17 @@ def clean_json_response(content):
 
 def ask_gigachat(
     history,
-    case_context=None
+    case_context=None,
+    response_plan=None,
+    correlation_id=None,
 ):
 
     access_token = get_access_token()
 
-    url = (
-        "https://api.giga.chat/"
-        "v1/chat/completions"
-    )
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": (
-            f"Bearer {access_token}"
-        ),
-    }
-
     system_content = SYSTEM_PROMPT
+
+    if response_plan:
+        system_content += "\n\n" + build_conversation_policy_prompt(response_plan)
 
     if case_context:
 
@@ -522,47 +533,15 @@ def ask_gigachat(
                 }
             )
 
-    data = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.7,
-    }
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=data,
-        timeout=60,
-        verify=SETTINGS.gigachat_tls_verify
-    )
-
-    if not response.ok:
-
-        print(
-            "\n===== GIGACHAT ERROR ====="
-        )
-
-        print(
-            "Status:",
-            response.status_code
-        )
-
-        print(
-            "Response:",
-            response.text
-        )
-
-        print(
-            "==========================\n"
-        )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    return (
-        result["choices"][0]
-        ["message"]["content"]
+    return generate_text(
+        messages,
+        access_token=access_token,
+        model=MODEL,
+        timeout=SETTINGS.gigachat_timeout_seconds,
+        ca_bundle=SETTINGS.gigachat_ca_bundle,
+        temperature=0.7,
+        stage="conversation",
+        correlation_id=correlation_id,
     )
 
 
@@ -572,23 +551,11 @@ def ask_gigachat(
 
 def analyze_case(
     history,
-    existing_case=None
+    existing_case=None,
+    correlation_id=None,
 ):
 
     access_token = get_access_token()
-
-    url = (
-        "https://api.giga.chat/"
-        "v1/chat/completions"
-    )
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": (
-            f"Bearer {access_token}"
-        ),
-    }
 
     existing_case_context = ""
 
@@ -708,47 +675,15 @@ other
                 }
             )
 
-    data = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0,
-    }
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=data,
-        timeout=60,
-        verify=SETTINGS.gigachat_tls_verify
-    )
-
-    if not response.ok:
-
-        print(
-            "\n===== CASE ANALYSIS ERROR ====="
-        )
-
-        print(
-            "Status:",
-            response.status_code
-        )
-
-        print(
-            "Response:",
-            response.text
-        )
-
-        print(
-            "================================\n"
-        )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    content = (
-        result["choices"][0]
-        ["message"]["content"]
+    content = generate_text(
+        messages,
+        access_token=access_token,
+        model=MODEL,
+        timeout=SETTINGS.gigachat_timeout_seconds,
+        ca_bundle=SETTINGS.gigachat_ca_bundle,
+        temperature=0,
+        stage="analyze_case",
+        correlation_id=correlation_id,
     )
 
     content = clean_json_response(
@@ -1536,6 +1471,10 @@ async def handle_message(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    correlation_id = getattr(update, "update_id", None)
+    if correlation_id is None:
+        correlation_id = getattr(update.message, "message_id", None)
+
     client_id = get_or_create_client(
         update
     )
@@ -1573,6 +1512,12 @@ async def handle_message(
         user_message
     )
 
+    greeting = pure_greeting_response(user_message)
+    if greeting:
+        save_message(client_id, "assistant", greeting)
+        await update.message.reply_text(greeting)
+        return
+
     # -----------------------------------------------------
     # Получаем историю
     # -----------------------------------------------------
@@ -1591,19 +1536,73 @@ async def handle_message(
         )
     )
 
-    routing = route_message(
+    response_plan = plan_response(
         user_message,
         existing_case,
+        conversation_history=history[:-1],
+    )
+    answer_source = select_answer_source(
+        user_message, response_plan, existing_case
+    )
+    reference_intent = response_plan.trusted_facts.get("reference_intent")
+    use_case_context = not (
+        reference_intent == "district_comparison"
+        and existing_case
+        and existing_case.get("category") != "housing"
+    )
+    case_context = (
+        format_case_for_ai(existing_case)
+        if existing_case and use_case_context
+        else None
+    )
+    print(
+        "[CONVERSATION_POLICY] "
+        f"mode={response_plan.mode} "
+        f"standard={response_plan.standard_id} "
+        f"version={response_plan.standard_version} "
+        f"decision={response_plan.next_action} "
+        f"source={answer_source}"
     )
 
-    if routing["intent"] == CONVERSATION:
+    if answer_source == TRUSTED_REFERENCE:
+        answer = format_reference_answer(response_plan.trusted_facts)
+        save_message(client_id, "assistant", answer)
+        await update.message.reply_text(answer)
+        return
+
+    if (
+        answer_source == PROVIDER_SEARCH
+        and reference_intent == "district_operational_question"
+    ):
+        answer = format_current_source_requirement(user_message)
+        save_message(client_id, "assistant", answer)
+        await update.message.reply_text(answer)
+        return
+
+    routing = route_with_conversation_policy(
+        user_message, existing_case, response_plan
+    )
+
+    continuity = response_plan.case_continuity
+    if continuity == CLARIFY_CONTINUITY:
+        question = build_continuity_question(existing_case, user_message)
+        save_message(client_id, "assistant", question)
+        await update.message.reply_text(question)
+        return
+    routing = apply_case_continuity(routing, continuity, existing_case)
+
+    if should_use_conversation_flow(routing["intent"], response_plan):
         try:
             answer = await run_blocking(
                 ask_gigachat,
                 history,
-                None,
+                case_context,
+                response_plan,
+                correlation_id,
             )
-            answer = guard_conversational_answer(answer)
+            answer = guard_client_voice(
+                guard_policy_answer(answer, response_plan), user_message
+            )
             save_message(client_id, "assistant", answer)
             await update.message.reply_text(answer)
         except Exception as e:
@@ -1653,6 +1652,7 @@ async def handle_message(
                 analyze_case,
                 history,
                 case_for_analysis,
+                correlation_id,
             )
 
         print(
@@ -1733,6 +1733,8 @@ async def handle_message(
                 routing["intent"],
                 category,
                 case_status,
+                current_case_relevant=response_plan.current_case_relevant,
+                continuity_resolved=(continuity != CLARIFY_CONTINUITY),
             )
         ):
 
@@ -1815,6 +1817,13 @@ async def handle_message(
 
             return
 
+    except GigaChatGenerationError:
+
+        await update.message.reply_text(
+            GENERATION_DELAY_MESSAGE
+        )
+        return
+
     except Exception as e:
 
         print(
@@ -1828,13 +1837,18 @@ async def handle_message(
     # -----------------------------------------------------
 
     try:
-
+        policy_case = active_case if "active_case" in locals() else existing_case
+        fallback_plan = plan_response(user_message, policy_case)
         answer = await run_blocking(
             ask_gigachat,
             history,
             case_context,
+            fallback_plan,
+            correlation_id,
         )
-        answer = guard_conversational_answer(answer)
+        answer = guard_client_voice(
+            guard_policy_answer(answer, fallback_plan), user_message
+        )
 
         save_message(
             client_id,

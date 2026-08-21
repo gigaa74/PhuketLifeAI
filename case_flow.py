@@ -21,7 +21,10 @@ def persist_case_analysis(client_id, case_analysis, routing, existing_case=None)
     if (
         existing_case
         and routing["intent"] == NEW_CASE
-        and category != existing_case.get("category")
+        and (
+            category != existing_case.get("category")
+            or routing.get("force_new_case")
+        )
     ):
         case_engine.set_case_status(existing_case["id"], "cancelled")
         existing_case = None

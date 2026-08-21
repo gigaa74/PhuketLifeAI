@@ -43,6 +43,19 @@ BACKGROUND_CLAIMS = (
     "занимаюсь поиском",
     "ожидайте",
     "ждите",
+    "мы скоро найдём",
+    "мы скоро найдем",
+    "найдём и вернёмся",
+    "найдем и вернемся",
+    "позже всё подберём",
+    "позже все подберем",
+    "сейчас займёмся",
+    "сейчас займемся",
+)
+
+GENERATION_DELAY_MESSAGE = (
+    "Сейчас возникла временная техническая задержка. "
+    "Пожалуйста, повторите сообщение через несколько секунд."
 )
 
 ACTION_CLAIMS = (
@@ -108,3 +121,43 @@ def conversational_answer_is_safe(text):
 
 def guard_conversational_answer(text):
     return text if conversational_answer_is_safe(text) else TRUTHFUL_FALLBACK
+
+
+FORMAL_GREETING = "Здравствуйте! Рады Вас видеть 🙂 Чем можем помочь?"
+FORMAL_VOICE_FALLBACK = (
+    "Подскажите, пожалуйста, чем мы можем помочь?"
+)
+
+
+def guard_client_voice(text, user_message=None):
+    original = str(text or "").strip()
+    normalized = original.casefold()
+    informal = re.search(
+        r"\b(?:ты|тебя|тебе|тобой|твой|твоя|твои)\b", normalized
+    )
+    singular_team_voice = (
+        re.search(r"\b(?:я|рад|рада|помогу|подскажу|рекомендую)\b", normalized)
+        or re.search(
+            r"\bготов(?:а)?\s+(?:вам\s+)?"
+            r"(?:помочь|подсказать|ответить|рекомендовать)\b",
+            normalized,
+        )
+        or re.search(
+            r"\bмогу\s+(?:вам\s+)?"
+            r"(?:помочь|подсказать|подобрать|рекомендовать)\b",
+            normalized,
+        )
+    )
+    if informal or singular_team_voice:
+        greeting = str(user_message or "").casefold().strip(" .!?,")
+        if greeting in {"привет", "здравствуйте", "добрый день", "добрый вечер"}:
+            return FORMAL_GREETING
+        return FORMAL_VOICE_FALLBACK
+    replacements = {
+        r"\bвы\b": "Вы", r"\bвас\b": "Вас", r"\bвам\b": "Вам",
+        r"\bваш\b": "Ваш", r"\bваша\b": "Ваша", r"\bваши\b": "Ваши",
+    }
+    result = original
+    for pattern, replacement in replacements.items():
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    return result

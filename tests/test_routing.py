@@ -178,6 +178,27 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(route["intent"], NEW_CASE)
         self.assertEqual(route["category"], "transfer")
 
+    def test_search_hard_gate_requires_current_case_relevance(self):
+        self.assertFalse(
+            should_start_search(
+                CASE_UPDATE,
+                "housing",
+                "ready_for_search",
+                current_case_relevant=False,
+            )
+        )
+
+    def test_search_hard_gate_requires_resolved_continuity(self):
+        self.assertFalse(
+            should_start_search(
+                CASE_UPDATE,
+                "housing",
+                "ready_for_search",
+                current_case_relevant=True,
+                continuity_resolved=False,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

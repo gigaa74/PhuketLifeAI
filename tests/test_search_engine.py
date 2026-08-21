@@ -16,6 +16,10 @@ from search_engine import (
     search_housing,
     validate_case,
 )
+from geo_relevance import (
+    canonicalize_known_property_url,
+    result_has_phuket_geo_evidence,
+)
 from search_presentation import CONCRETE_PROPERTY, LISTING_PAGE
 
 
@@ -27,14 +31,14 @@ class StubProvider:
             {
                 "name": "Example",
                 "url": "https://example.com/property/1",
-                "description": "Pet friendly apartment",
+                "description": "Pet friendly apartment in Phuket",
                 "price": 50000,
                 "currency": "RUB",
             },
             {
                 "name": "Duplicate",
                 "url": "https://example.com/property/1",
-                "description": "Same URL",
+                "description": "Same URL in Phuket",
             },
         ]
 
@@ -68,7 +72,7 @@ class SequencedStubProvider:
             {
                 "name": name,
                 "url": f"https://example.com/{name.lower()}",
-                "description": name,
+                "description": f"{name} Phuket",
             }
             for name in names
         ]
@@ -150,6 +154,7 @@ class SearchEngineTests(unittest.TestCase):
         self.assertTrue(any("site:booking.com/hotel" in query for query in queries))
         self.assertTrue(any("site:airbnb.com/rooms" in query for query in queries))
         self.assertTrue(any("specific property" in query for query in queries))
+        self.assertTrue(all("phuket" in query.casefold() for query in queries))
 
     def test_booking_hotel_page_is_concrete(self):
         self.assertEqual(
@@ -200,6 +205,7 @@ class SearchEngineTests(unittest.TestCase):
                     {
                         "name": "New",
                         "url": "https://airbnb.com/rooms/123456",
+                        "description": "Apartment in Phuket",
                     },
                 ]
 
@@ -220,6 +226,7 @@ class SearchEngineTests(unittest.TestCase):
                     {
                         "name": f"Concrete {index}",
                         "url": f"https://booking.com/hotel/th/concrete-{index}.html",
+                        "location_text": "Phuket",
                     }
                     for index in range(3)
                 ]
@@ -227,6 +234,7 @@ class SearchEngineTests(unittest.TestCase):
                     {
                         "name": f"Catalog {index}",
                         "url": f"https://example.com/property-for-rent/{index}",
+                        "location_text": "Phuket",
                     }
                     for index in range(3)
                 ]
@@ -306,6 +314,101 @@ class SearchEngineTests(unittest.TestCase):
         )
         self.assertEqual(changed_options["excluded_urls"], [])
         self.assertEqual(changed_options["page"], 0)
+
+    def test_geo_gate_rejects_atlanta_and_missing_evidence(self):
+        self.assertFalse(result_has_phuket_geo_evidence(
+            {
+                "title": "Apartment in Atlanta",
+                "snippet": "Downtown Atlanta, Georgia",
+                "url": "https://www.airbnb.com/rooms/123",
+            },
+            "Rawai",
+        ))
+        self.assertFalse(result_has_phuket_geo_evidence(
+            {
+                "title": "Beautiful beach apartment",
+                "snippet": "Sea view residence",
+                "url": "https://www.airbnb.com/rooms/456",
+            },
+            "Rawai",
+        ))
+
+    def test_geo_gate_accepts_rawai_or_phuket_provider_evidence(self):
+        self.assertTrue(result_has_phuket_geo_evidence(
+            {
+                "title": "Rawai Beach Residence",
+                "url": "https://www.booking.com/hotel/th/rawai-residence.html",
+            },
+            "Rawai",
+        ))
+        self.assertTrue(result_has_phuket_geo_evidence(
+            {"title": "Island stay", "location_text": "Phuket, Thailand"},
+            "Rawai",
+        ))
+
+    def test_airbnb_room_locale_is_canonicalized(self):
+        expected = "https://www.airbnb.com/rooms/123456?check_in=2026-09-01"
+        for url in (
+            "https://bg.airbnb.com/rooms/123456?check_in=2026-09-01",
+            "https://es.airbnb.com/rooms/123456?check_in=2026-09-01",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(canonicalize_known_property_url(url), expected)
+
+    def test_airbnb_locale_variants_deduplicate_after_canonicalization(self):
+        class LocaleProvider:
+            name = "locale"
+
+            def search(self, search_request):
+                return [
+                    {
+                        "name": "Rawai room",
+                        "location_text": "Rawai, Phuket",
+                        "url": f"https://{locale}.airbnb.com/rooms/123456",
+                    }
+                    for locale in ("bg", "es")
+                ]
+
+        results = HousingSearchEngine([LocaleProvider()]).search({
+            "location": "Rawai",
+            "arrival_date": "1 сентября 2026",
+            "departure_date": "15 сентября 2026",
+        })
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            results[0]["url"], "https://www.airbnb.com/rooms/123456"
+        )
+
+    def test_geo_filter_does_not_refill_limit_with_irrelevant_results(self):
+        class GeoMixedProvider:
+            name = "geo-mixed"
+
+            def search(self, search_request):
+                return [
+                    {
+                        "name": "Rawai Residence",
+                        "url": "https://www.booking.com/hotel/th/rawai-residence.html",
+                    },
+                    {
+                        "name": "Kata Residence",
+                        "url": "https://www.booking.com/hotel/th/kata-residence.html",
+                    },
+                    {
+                        "name": "Atlanta Apartment",
+                        "url": "https://www.airbnb.com/rooms/999",
+                        "location_text": "Atlanta, Georgia",
+                    },
+                ]
+
+        case = self._ready_case()
+        case["data"]["location"] = "Rawai"
+        result = search_housing(
+            case, providers=[GeoMixedProvider()], result_limit=5
+        )
+        self.assertEqual(len(result["results"]), 2)
+        self.assertNotIn("Atlanta Apartment", [
+            item["name"] for item in result["results"]
+        ])
 
     @staticmethod
     def _ready_case():
