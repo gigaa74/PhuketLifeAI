@@ -271,6 +271,39 @@ def _migration_006_partner_operating_system(connection):
     )
 
 
+def _migration_007_scout_candidates(connection):
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS scout_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scout_type TEXT NOT NULL CHECK(scout_type IN ('partner', 'client')),
+            source_chat_id INTEGER NOT NULL,
+            source_chat_title TEXT,
+            source_message_id INTEGER NOT NULL,
+            source_user_id INTEGER,
+            source_username TEXT,
+            original_text TEXT NOT NULL,
+            detected_category TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            detection_reasons TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'needs_review',
+            owner_decision TEXT NOT NULL DEFAULT 'pending',
+            owner_decided_at TIMESTAMP,
+            owner_decided_by INTEGER,
+            outreach_status TEXT NOT NULL DEFAULT 'not_contacted',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(scout_type, source_chat_id, source_message_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scout_candidates_review
+            ON scout_candidates(scout_type, status, id);
+        CREATE INDEX IF NOT EXISTS idx_scout_candidates_identity
+            ON scout_candidates(scout_type, source_user_id, id)
+            WHERE source_user_id IS NOT NULL;
+        """
+    )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
@@ -278,6 +311,7 @@ MIGRATIONS = (
     (4, _migration_004_partner_network),
     (5, _migration_005_partner_handoff),
     (6, _migration_006_partner_operating_system),
+    (7, _migration_007_scout_candidates),
 )
 
 
