@@ -17,6 +17,7 @@ def admin_panel_buttons():
     return [
         [("🗂 Кейсы", "admin:cases"), ("📋 Предложения", "admin:offers")],
         [("🤝 Партнёры", "admin:partners")],
+        [("📝 Заявки партнёров", "admin:applications")],
         [("📩 Запросы партнёрам", "admin:requests")],
         [("⚙️ Настройки", "admin:settings")],
     ]

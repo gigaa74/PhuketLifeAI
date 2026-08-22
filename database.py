@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 DB_NAME = "phuketlife.db"
@@ -304,6 +305,56 @@ def _migration_007_scout_candidates(connection):
     )
 
 
+def _migration_008_scout_detected_categories(connection):
+    columns = _column_names(connection, "scout_candidates")
+    if "detected_categories" not in columns:
+        connection.execute(
+            "ALTER TABLE scout_candidates ADD COLUMN detected_categories TEXT"
+        )
+    rows = connection.execute(
+        """SELECT id, detected_category FROM scout_candidates
+           WHERE detected_categories IS NULL OR trim(detected_categories) = ''"""
+    ).fetchall()
+    for candidate_id, category in rows:
+        connection.execute(
+            "UPDATE scout_candidates SET detected_categories=? WHERE id=?",
+            (json.dumps([category], ensure_ascii=False), candidate_id),
+        )
+
+
+def _migration_009_partner_applications(connection):
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS partner_applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_user_id INTEGER NOT NULL,
+            telegram_username TEXT,
+            applicant_name TEXT,
+            services_text TEXT,
+            areas_text TEXT,
+            contact_text TEXT,
+            status TEXT NOT NULL DEFAULT 'collecting'
+                CHECK(status IN ('collecting', 'needs_review', 'approved',
+                                 'rejected', 'cancelled')),
+            current_step TEXT NOT NULL DEFAULT 'name',
+            partner_id INTEGER,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            submitted_at TIMESTAMP,
+            decided_at TIMESTAMP,
+            decided_by INTEGER,
+            decision_note TEXT,
+            FOREIGN KEY (partner_id) REFERENCES partners(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_applications_open_identity
+            ON partner_applications(telegram_user_id)
+            WHERE status IN ('collecting', 'needs_review');
+        CREATE INDEX IF NOT EXISTS idx_partner_applications_review
+            ON partner_applications(status, id);
+        """
+    )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
@@ -312,6 +363,8 @@ MIGRATIONS = (
     (5, _migration_005_partner_handoff),
     (6, _migration_006_partner_operating_system),
     (7, _migration_007_scout_candidates),
+    (8, _migration_008_scout_detected_categories),
+    (9, _migration_009_partner_applications),
 )
 
 
@@ -369,6 +422,18 @@ def get_or_create_client(
                 (telegram_id, username, first_name, last_name),
             )
         return cursor.lastrowid
+    finally:
+        connection.close()
+
+
+def get_client_by_telegram_id(telegram_id, db_path=None):
+    connection = get_connection(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT * FROM clients WHERE telegram_id = ?", (int(telegram_id),)
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         connection.close()
 

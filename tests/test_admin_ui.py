@@ -81,6 +81,7 @@ class AdminUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             labels,
             ["🗂 Кейсы", "📋 Предложения", "🤝 Партнёры",
+             "📝 Заявки партнёров",
              "📩 Запросы партнёрам", "⚙️ Настройки"],
         )
 

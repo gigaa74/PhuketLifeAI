@@ -346,6 +346,33 @@ def sync_partner_telegram_identity(telegram_user_id, telegram_username=None,
         connection.close()
 
 
+def resolve_partner_telegram_identity(telegram_user_id, telegram_username=None,
+                                      db_path=None):
+    """Resolve a partner safely and distinguish no match from identity conflict."""
+    try:
+        partner = sync_partner_telegram_identity(
+            telegram_user_id, telegram_username, db_path
+        )
+    except PartnerUnavailableError:
+        return {"status": "conflict", "partner": None}
+    if partner:
+        return {"status": "partner", "partner": partner}
+    username = _normalize_telegram_username(telegram_username)
+    if username:
+        connection = get_connection(db_path)
+        try:
+            matches = connection.execute(
+                """SELECT COUNT(*) FROM partners
+                   WHERE lower(ltrim(COALESCE(telegram_username, ''), '@')) = lower(?)""",
+                (username,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        if matches:
+            return {"status": "conflict", "partner": None}
+    return {"status": "not_found", "partner": None}
+
+
 def _case_areas(case):
     data = case.get("data") or {}
     candidates = (

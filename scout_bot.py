@@ -5,6 +5,7 @@ from database import init_db
 from scout_candidates import save_scout_candidate
 from scout_config import load_scout_settings
 from scout_detector import classify_scout_message
+from scout_labels import category_label_ru, scout_type_label_ru
 
 
 SCOUT_MESSAGE_FILTER = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
@@ -12,6 +13,9 @@ SCOUT_MESSAGE_FILTER = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
 
 def _format_owner_notification(candidate):
     reasons = "; ".join(candidate["detection_reasons"])
+    detected_categories = candidate.get("detected_categories") or [
+        candidate["detected_category"]
+    ]
     identity = (
         f"Telegram user ID: {candidate['source_user_id']}"
         if candidate.get("source_user_id") is not None
@@ -20,13 +24,16 @@ def _format_owner_notification(candidate):
     username = candidate.get("source_username")
     return (
         "🔎 Scout обнаружил кандидата\n\n"
-        f"Тип: {candidate['scout_type']}\n"
-        f"Категория: {candidate['detected_category']}\n"
+        f"Тип: {scout_type_label_ru(candidate['scout_type'])}\n"
+        f"Основная категория: {category_label_ru(candidate['detected_category'])}\n"
+        "Найденные категории: "
+        + ", ".join(category_label_ru(item) for item in detected_categories)
+        + "\n"
+        "Сила сигнала: высокая\n"
         f"Источник: {candidate.get('source_chat_title') or candidate['source_chat_id']}\n"
         f"{identity}\n"
         f"Username: {'@' + username if username else 'не указан'}\n"
-        f"Причины: {reasons}\n"
-        f"Уверенность: {candidate['confidence']:.2f}\n\n"
+        f"Причины: {reasons}\n\n"
         f"Исходное сообщение:\n{candidate['original_text']}\n\n"
         "Статус: требуется решение владельца"
     )

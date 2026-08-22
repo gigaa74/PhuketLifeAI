@@ -19,6 +19,15 @@ def _candidate(row):
         return None
     result = dict(row)
     result["detection_reasons"] = json.loads(result["detection_reasons"] or "[]")
+    raw_categories = result.get("detected_categories")
+    try:
+        categories = json.loads(raw_categories) if raw_categories else []
+    except (TypeError, json.JSONDecodeError):
+        categories = []
+    result["detected_categories"] = (
+        categories if isinstance(categories, list) and categories
+        else [result["detected_category"]]
+    )
     return result
 
 
@@ -57,14 +66,20 @@ def save_scout_candidate(scout_type, observation, detection, db_path=None):
                 """INSERT INTO scout_candidates
                    (scout_type, source_chat_id, source_chat_title, source_message_id,
                     source_user_id, source_username, original_text,
-                    detected_category, confidence, detection_reasons, status,
+                    detected_category, detected_categories, confidence,
+                    detection_reasons, status,
                     updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     scout_type, observation["source_chat_id"],
                     observation.get("source_chat_title"),
                     observation["source_message_id"], user_id, username,
                     observation["original_text"], detection["detected_category"],
+                    json.dumps(
+                        detection.get("detected_categories")
+                        or [detection["detected_category"]],
+                        ensure_ascii=False,
+                    ),
                     detection["confidence"],
                     json.dumps(detection["detection_reasons"], ensure_ascii=False),
                     detection.get("status", "needs_review"), _now(),

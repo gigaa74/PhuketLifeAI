@@ -1,5 +1,7 @@
 import re
 
+from scout_labels import category_label_ru
+
 
 CATEGORY_PATTERNS = {
     "housing": r"\b(?:квартир\w*|апартамент\w*|вилл\w*|жиль[её]|дом\w*)\b",
@@ -41,14 +43,15 @@ def classify_scout_message(scout_type, text):
         return None
     category = categories[0]
     reasons = [
-        f"Обнаружена категория: {category}",
+        "Обнаружены категории: "
+        + ", ".join(category_label_ru(item) for item in categories),
         "Обнаружено предложение услуги" if scout_type == "partner"
         else "Обнаружена явная потребность в услуге",
     ]
-    confidence = 0.9 if len(categories) == 1 else 0.8
     return {
         "detected_category": category,
-        "confidence": confidence,
+        "detected_categories": categories,
+        "confidence": 0.9,
         "detection_reasons": reasons,
         "status": "needs_review",
     }

@@ -37,6 +37,7 @@ from partner_network import (
     set_partner_auto_handoff,
     set_partner_status,
     sync_partner_telegram_identity,
+    resolve_partner_telegram_identity,
     update_partner,
 )
 from partner_handoff import (
@@ -85,6 +86,16 @@ from partner_authority import (
     guard_partner_response,
     list_pending_proposals,
     record_proposal_delivery,
+)
+from partner_applications import (
+    PartnerApplicationError,
+    cancel_application,
+    decide_application,
+    get_application,
+    get_open_application,
+    list_applications,
+    record_application_answer,
+    start_application,
 )
 
 from case_engine import (
@@ -139,6 +150,7 @@ from config import load_settings
 from database import (
     init_db,
     get_connection,
+    get_client_by_telegram_id,
     get_or_create_client as db_get_or_create_client,
 )
 
@@ -801,10 +813,105 @@ def build_search_confirmation(
 # START
 # =========================================================
 
+PARTNER_START_WELCOME = """{name}, здравствуйте! 👋
+
+Ваш Telegram успешно подключён к партнёрской системе Phuket Life.
+
+Теперь бот распознаёт Вас как партнёра. Здесь Вы сможете:
+— передавать актуальную информацию по объектам и услугам;
+— получать запросы, которые владелец Phuket Life предварительно одобрил;
+— сообщать об изменениях условий;
+— получать подтверждения по совместной работе.
+
+Коммерческие условия не изменяются автоматически: любые новые условия сначала направляются владельцу Phuket Life на утверждение.
+
+Подключение завершено ✅"""
+
+CLIENT_START_WELCOME = """Здравствуйте! 👋
+Это Phuket Life — AI-консьерж на Пхукете.
+
+Мы поможем подобрать и организовать:
+— жильё;
+— трансфер;
+— аренду автомобиля или байка;
+— экскурсии и активности;
+— другие услуги и бытовые вопросы на Пхукете.
+
+Напишите своими словами, что Вам нужно. Например:
+“Ищу квартиру в Кароне на месяц”
+или
+“Нужен трансфер из аэропорта”.
+
+Сначала мы уточним необходимые детали, а реальные цены и наличие проверим через актуальные источники и партнёров."""
+
+ADMIN_START_WELCOME = """Здравствуйте! 👋
+
+Вы вошли как администратор Phuket Life.
+Для открытия панели используйте команду /admin."""
+
+IDENTITY_CONFLICT_WELCOME = """Здравствуйте! 👋
+
+Не удалось безопасно подтвердить роль для этого Telegram-профиля. Мы передали вопрос владельцу Phuket Life для ручной проверки."""
+
+ROLE_CHOICE_WELCOME = """Здравствуйте! 👋
+Это Phuket Life — AI-консьерж на Пхукете.
+
+Подскажите, пожалуйста, чем мы можем быть Вам полезны?"""
+
+APPLICATION_UNDER_REVIEW = """Ваша заявка на партнёрство уже передана владельцу Phuket Life и ожидает рассмотрения.
+
+Мы сообщим Вам после принятия решения."""
+
+APPLICATION_QUESTIONS = {
+    "name": "Представьтесь, пожалуйста: укажите Ваше имя или название компании.",
+    "services": "Какие услуги Вы предлагаете?",
+    "areas": "В каких районах Вы работаете?",
+    "contact": "Укажите удобный контакт для связи.",
+}
+
+
+def _role_choice_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧳 Нужна услуга", callback_data="role:client")],
+        [InlineKeyboardButton(
+            "🤝 Хочу стать партнёром", callback_data="role:partner"
+        )],
+    ])
+
+
+def _application_cancel_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Отменить заполнение", callback_data="role:cancel")
+    ]])
+
+
+async def _notify_owner_identity_conflict(update, context):
+    admin_id = SETTINGS.telegram_admin_user_id
+    if admin_id is None:
+        return False
+    user = update.effective_user
+    try:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=(
+                "⚠️ Не удалось безопасно подтвердить роль Telegram-профиля.\n\n"
+                f"Telegram user ID: {user.id}\n"
+                f"Username: {'@' + user.username if user.username else 'не указан'}\n"
+                "Требуется ручная проверка владельца."
+            ),
+        )
+    except Exception:
+        return False
+    return True
+
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
+    if is_admin(SETTINGS.telegram_admin_user_id, update.effective_user.id):
+        await update.message.reply_text(ADMIN_START_WELCOME)
+        return
 
     if context.args and context.args[0].startswith("partner_"):
         token = context.args[0][len("partner_"):]
@@ -820,21 +927,160 @@ async def start(
             )
             return
         await update.message.reply_text(
-            f"Партнёр {partner['name']} подключён к Phuket Life. 🤝\n\n"
-            "Теперь отвечайте reply на сообщения с запросами."
+            PARTNER_START_WELCOME.format(name=partner["name"])
         )
         return
 
-    get_or_create_client(update)
+    resolution = resolve_partner_telegram_identity(
+        update.effective_user.id, update.effective_user.username
+    )
+    if resolution["status"] == "partner":
+        if resolution["partner"].get("status") != "active":
+            await _notify_owner_identity_conflict(update, context)
+            await update.message.reply_text(IDENTITY_CONFLICT_WELCOME)
+            return
+        await update.message.reply_text(
+            PARTNER_START_WELCOME.format(name=resolution["partner"]["name"])
+        )
+        return
+    if resolution["status"] == "conflict":
+        await _notify_owner_identity_conflict(update, context)
+        await update.message.reply_text(IDENTITY_CONFLICT_WELCOME)
+        return
+
+    if get_client_by_telegram_id(update.effective_user.id):
+        await update.message.reply_text(CLIENT_START_WELCOME)
+        return
+
+    application = get_open_application(update.effective_user.id)
+    if application:
+        application, _ = start_application(
+            update.effective_user.id, update.effective_user.username
+        )
+    if application and application["status"] == "needs_review":
+        await update.message.reply_text(APPLICATION_UNDER_REVIEW)
+        return
+    if application and application["status"] == "collecting":
+        await update.message.reply_text(
+            APPLICATION_QUESTIONS[application["current_step"]],
+            reply_markup=_application_cancel_keyboard(),
+        )
+        return
 
     await update.message.reply_text(
-        "Здравствуйте! 👋\n\n"
-        "Я AI-консьерж Phuket Life.\n\n"
-        "Помогу организовать поездку и решить "
-        "различные вопросы, связанные с "
-        "пребыванием в Таиланде.\n\n"
-        "Расскажите, что вам необходимо."
+        ROLE_CHOICE_WELCOME, reply_markup=_role_choice_keyboard()
     )
+
+
+async def role_choice_callback_handler(update, context):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    resolution = resolve_partner_telegram_identity(user.id, user.username)
+    if resolution["status"] == "partner":
+        if resolution["partner"].get("status") != "active":
+            await _notify_owner_identity_conflict(update, context)
+            await query.edit_message_text(IDENTITY_CONFLICT_WELCOME)
+            return
+        await query.edit_message_text(
+            PARTNER_START_WELCOME.format(name=resolution["partner"]["name"])
+        )
+        return
+    if resolution["status"] == "conflict":
+        await _notify_owner_identity_conflict(update, context)
+        await query.edit_message_text(IDENTITY_CONFLICT_WELCOME)
+        return
+    if get_client_by_telegram_id(user.id):
+        await query.edit_message_text(CLIENT_START_WELCOME)
+        return
+    if query.data == "role:client":
+        open_application = get_open_application(user.id)
+        if open_application and open_application["status"] == "needs_review":
+            await query.edit_message_text(APPLICATION_UNDER_REVIEW)
+            return
+        if open_application:
+            cancel_application(user.id)
+        get_or_create_client(update)
+        await query.edit_message_text(CLIENT_START_WELCOME)
+        return
+    if query.data == "role:cancel":
+        cancelled = cancel_application(user.id)
+        context.user_data.pop("partner_application_id", None)
+        text = (
+            "Заполнение заявки отменено."
+            if cancelled and cancelled.get("status") == "cancelled"
+            else "Активной заявки для отмены нет."
+        )
+        await query.edit_message_text(
+            text, reply_markup=_role_choice_keyboard()
+        )
+        return
+    application, _ = start_application(user.id, user.username)
+    if application["status"] == "needs_review":
+        await query.edit_message_text(APPLICATION_UNDER_REVIEW)
+        return
+    context.user_data["partner_application_id"] = application["id"]
+    await query.edit_message_text(
+        APPLICATION_QUESTIONS[application["current_step"]],
+        reply_markup=_application_cancel_keyboard(),
+    )
+
+
+def _format_partner_application(application):
+    username = application.get("telegram_username")
+    return (
+        "📝 Новая заявка на партнёрство\n\n"
+        f"Имя / компания: {application.get('applicant_name') or '—'}\n"
+        f"Услуги: {application.get('services_text') or '—'}\n"
+        f"Районы: {application.get('areas_text') or '—'}\n"
+        f"Контакт: {application.get('contact_text') or '—'}\n"
+        f"Username: {'@' + username if username else 'не указан'}\n"
+        f"Статус: {application.get('status')}"
+    )
+
+
+async def partner_application_message_handler(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not message.text:
+        return
+    application = get_open_application(user.id)
+    if not application or application["status"] != "collecting":
+        return
+    application, _ = start_application(user.id, user.username)
+    application = record_application_answer(application["id"], message.text)
+    if application["status"] == "collecting":
+        context.user_data["partner_application_id"] = application["id"]
+        await message.reply_text(
+            APPLICATION_QUESTIONS[application["current_step"]],
+            reply_markup=_application_cancel_keyboard(),
+        )
+        raise ApplicationHandlerStop
+    context.user_data.pop("partner_application_id", None)
+    await message.reply_text(
+        "Спасибо! Ваша заявка передана владельцу Phuket Life на рассмотрение. "
+        "Партнёрские права пока не предоставлены."
+    )
+    admin_id = SETTINGS.telegram_admin_user_id
+    if admin_id is not None:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=_format_partner_application(application),
+            reply_markup=_admin_keyboard([[
+                ("✅ Утвердить", f"application:approve:{application['id']}"),
+                ("❌ Отклонить", f"application:reject:{application['id']}"),
+            ]]),
+        )
+    raise ApplicationHandlerStop
+
+
+async def partner_application_cancel_command(update, context):
+    application = cancel_application(update.effective_user.id)
+    context.user_data.pop("partner_application_id", None)
+    if application and application.get("status") == "cancelled":
+        await update.message.reply_text("Заполнение заявки отменено.")
+    else:
+        await update.message.reply_text("Активной заявки для отмены нет.")
 
 
 async def _require_admin(update):
@@ -1185,6 +1431,25 @@ async def _show_admin_offers(query):
     await query.edit_message_text(text, reply_markup=_admin_keyboard(buttons))
 
 
+async def _show_partner_applications(query):
+    applications = list_applications()
+    if not applications:
+        await query.edit_message_text(
+            "Заявок на партнёрство, ожидающих решения, нет.",
+            reply_markup=_admin_keyboard([[("⬅️ В панель", "admin:panel")]]),
+        )
+        return
+    buttons = [[(
+        f"{item['applicant_name']} — {item['services_text']}",
+        f"application:view:{item['id']}",
+    )] for item in applications]
+    buttons.append([("⬅️ В панель", "admin:panel")])
+    await query.edit_message_text(
+        "📝 Заявки на партнёрство",
+        reply_markup=_admin_keyboard(buttons),
+    )
+
+
 async def _show_offer(query, offer_id):
     offer = get_offer(offer_id)
     if not offer:
@@ -1326,6 +1591,8 @@ async def admin_callback_handler(update, context):
             await _show_admin_cases(query)
         elif query.data == "admin:offers":
             await _show_admin_offers(query)
+        elif query.data == "admin:applications":
+            await _show_partner_applications(query)
         elif query.data == "admin:partners":
             partners = list_partners()
             buttons = [[(f"Партнёр №{p['id']} — {p['name']}", f"partner:view:{p['id']}")]
@@ -1450,6 +1717,47 @@ async def admin_callback_handler(update, context):
                 "Утверждённые условия не изменены.\n\n" + delivery_status,
                 reply_markup=_admin_keyboard([[("🤝 Посмотреть партнёра", f"partner:view:{partner['id']}")]]),
             )
+        elif parts[:2] == ["application", "view"]:
+            application = get_application(int(parts[2]))
+            if not application:
+                raise PartnerApplicationError("Заявка не найдена")
+            buttons = [[
+                ("✅ Утвердить", f"application:approve:{application['id']}"),
+                ("❌ Отклонить", f"application:reject:{application['id']}"),
+            ], [("⬅️ К заявкам", "admin:applications")]]
+            await query.edit_message_text(
+                _format_partner_application(application),
+                reply_markup=_admin_keyboard(buttons),
+            )
+        elif parts[:2] in (["application", "approve"],
+                           ["application", "reject"]):
+            approved = parts[1] == "approve"
+            application = decide_application(
+                int(parts[2]), approved, update.effective_user.id
+            )
+            if approved:
+                text = (
+                    "✅ Заявка утверждена. Партнёр создан и Telegram подключён."
+                )
+            else:
+                text = "❌ Заявка отклонена. Партнёрские права не предоставлены."
+            try:
+                await context.bot.send_message(
+                    chat_id=application["telegram_user_id"],
+                    text=(
+                        "Ваша заявка на партнёрство утверждена. Теперь бот "
+                        "распознаёт Вас как партнёра."
+                        if approved else
+                        "Ваша заявка на партнёрство отклонена. Партнёрские "
+                        "права не предоставлены."
+                    ),
+                )
+            except Exception:
+                text += " Уведомление заявителю доставить не удалось."
+            await query.edit_message_text(
+                text,
+                reply_markup=_admin_keyboard([[("⬅️ К заявкам", "admin:applications")]]),
+            )
     except AdminCaseNotFoundError:
         await query.edit_message_text("Кейс не найден.")
     except DuplicateOfferSendError:
@@ -1458,7 +1766,8 @@ async def admin_callback_handler(update, context):
         await query.edit_message_text("Активный запрос этому партнёру уже существует.")
     except (OfferTelegramError, PartnerTelegramError):
         await query.edit_message_text("Telegram не подтвердил отправку. Попробуйте ещё раз.")
-    except (OfferHandoffError, PartnerNetworkError) as error:
+    except (OfferHandoffError, PartnerNetworkError,
+            PartnerApplicationError) as error:
         await query.edit_message_text(f"Не удалось выполнить действие: {error}")
 
 
@@ -1563,13 +1872,14 @@ async def partner_identity_sync_handler(update, context):
     user = update.effective_user
     if not user:
         return
-    partner = sync_partner_telegram_identity(user.id, user.username)
     message = update.effective_message
-    if not partner or partner.get("status") != "active" or not message:
+    if not message:
         return
-
     response_text = message.text or message.caption or ""
     if response_text.lstrip().startswith("/"):
+        return
+    partner = sync_partner_telegram_identity(user.id, user.username)
+    if not partner or partner.get("status") != "active":
         return
     proposal = create_pending_proposal(
         partner["id"], response_text, source="telegram_partner_message",
@@ -2097,6 +2407,10 @@ def main():
         )
     )
 
+    app.add_handler(
+        CommandHandler("cancel", partner_application_cancel_command)
+    )
+
     for command, callback in (
         ("admin", admin_command),
         ("partners", partners_command),
@@ -2117,9 +2431,24 @@ def main():
 
     app.add_handler(
         CallbackQueryHandler(
-            admin_callback_handler,
-            pattern=r"^(admin|case|offer|partner|terms):",
+            role_choice_callback_handler,
+            pattern=r"^role:(client|partner|cancel)$",
         )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_callback_handler,
+            pattern=r"^(admin|case|offer|partner|terms|application):",
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            partner_application_message_handler,
+        ),
+        group=-3,
     )
 
     app.add_handler(
