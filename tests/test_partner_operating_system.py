@@ -134,12 +134,18 @@ class PartnerOperatingSystemTests(unittest.TestCase):
             connection.close()
         self.assertEqual(audit, ("proposal_recorded", "partner"))
 
-    def test_profile_contains_internal_operating_fields(self):
+    def test_profile_keeps_internal_fields_but_main_card_is_concise(self):
         self.proposal()
-        card = format_partner_card(get_partner(self.partner["id"], self.db_path))
-        for label in ("Тип:", "Утверждённые условия:", "Ожидают решения:",
-                      "Разрешённые действия:", "Операционные заметки:"):
-            self.assertIn(label, card)
+        partner = get_partner(self.partner["id"], self.db_path)
+        for field in ("partner_type", "approved_terms", "pending_terms",
+                      "allowed_actions", "operational_notes"):
+            self.assertIn(field, partner)
+        card = format_partner_card(partner)
+        self.assertIn("Формат: Гибридный партнёр", card)
+        self.assertIn("Ожидают решения: 1", card)
+        for hidden in ("Утверждённые условия:", "Разрешённые действия:",
+                       "Операционные заметки:"):
+            self.assertNotIn(hidden, card)
 
     def test_migration_is_non_destructive_for_legacy_partner(self):
         legacy_path = Path(self.temp.name) / "legacy.db"

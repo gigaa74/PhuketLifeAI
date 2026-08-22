@@ -88,7 +88,7 @@ class AdminUiTests(unittest.IsolatedAsyncioTestCase):
     def test_admin_cards_translate_internal_values(self):
         partner_card = format_partner_card(self.partner)
         self.assertIn("Статус: Активен", partner_card)
-        self.assertIn("Услуги: Жильё, Трансфер", partner_card)
+        self.assertIn("Направление: Жильё, Трансфер", partner_card)
         self.assertNotIn("active", partner_card)
         offer_card = format_offer_list_item(
             {"id": 3, "case_id": self.case_id, "partner_id": self.partner["id"],

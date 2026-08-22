@@ -71,8 +71,13 @@ from admin_ui import (
     execute_partner_auto_toggle,
     execute_partner_send,
     format_offer_list_item,
+    format_partner_allowed_actions,
     format_partner_card,
+    format_partner_commercial_terms,
+    format_partner_open_questions,
+    format_partner_operations,
     offer_action_buttons,
+    partner_auto_confirmation_buttons,
     partner_action_buttons,
     commercial_proposal_buttons,
     pending_proposal_list_buttons,
@@ -1492,6 +1497,35 @@ async def _show_partner(query, partner_id, case_id=None):
     )
 
 
+async def _show_partner_section(query, partner_id, formatter):
+    partner = get_partner(partner_id)
+    if not partner:
+        await query.edit_message_text("Партнёр не найден.")
+        return
+    await query.edit_message_text(
+        formatter(partner),
+        reply_markup=_admin_keyboard([[
+            ("⬅️ Назад к партнёру", f"partner:view:{partner_id}")
+        ]]),
+    )
+
+
+async def _show_partner_auto_confirmation(query, partner_id):
+    partner = get_partner(partner_id)
+    if not partner:
+        await query.edit_message_text("Партнёр не найден.")
+        return
+    await query.edit_message_text(
+        "Включить автоматическую отправку одобренных запросов партнёру "
+        f"{partner['name']}?\n\n"
+        "Неподтверждённые коммерческие условия и заявки без разрешения "
+        "отправляться не будут.",
+        reply_markup=_admin_keyboard(
+            partner_auto_confirmation_buttons(partner_id)
+        ),
+    )
+
+
 def _format_decision_terms(changes):
     labels = {
         "commission": "комиссия", "discount": "скидка",
@@ -1668,6 +1702,24 @@ async def admin_callback_handler(update, context):
             await _show_partner(
                 query, int(parts[2]), int(parts[3]) if len(parts) > 3 else None
             )
+        elif parts[:2] == ["partner", "commercial"]:
+            await _show_partner_section(
+                query, int(parts[2]), format_partner_commercial_terms
+            )
+        elif parts[:2] == ["partner", "operations"]:
+            await _show_partner_section(
+                query, int(parts[2]), format_partner_operations
+            )
+        elif parts[:2] == ["partner", "questions"]:
+            await _show_partner_section(
+                query, int(parts[2]), format_partner_open_questions
+            )
+        elif parts[:2] == ["partner", "actions"]:
+            await _show_partner_section(
+                query, int(parts[2]), format_partner_allowed_actions
+            )
+        elif parts[:2] == ["partner", "auto_confirm"]:
+            await _show_partner_auto_confirmation(query, int(parts[2]))
         elif parts[:2] == ["partner", "auto"]:
             partner = execute_partner_auto_toggle(int(parts[2]), parts[3] == "on")
             await _show_partner(query, partner["id"])
