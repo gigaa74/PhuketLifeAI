@@ -307,7 +307,7 @@ class PartnerHandoffMigrationTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(partner, ("Test Partner 2", 0))
             self.assertEqual(request[0], "raw")
-            self.assertEqual(versions, [1, 2, 3, 4, 5])
+            self.assertEqual(versions, [1, 2, 3, 4, 5, 6])
 
 
 if __name__ == "__main__":

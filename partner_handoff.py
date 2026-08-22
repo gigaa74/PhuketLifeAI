@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from database import get_connection
 from partner_network import DECLINE_PHRASES, get_partner
+from partner_authority import detect_commercial_changes
 
 
 TERMINAL_CASE_STATUSES = {"completed", "closed", "cancelled"}
@@ -67,6 +68,8 @@ def _safe_client_text(text):
     value = re.sub(r"(?<!\w)@[A-Za-z0-9_]{5,}", "", str(text or ""))
     value = re.sub(r"https?://(?:t\.me|telegram\.me)/\S+", "", value, flags=re.I)
     value = re.sub(r"(?:\+?\d[\d\s()\-]{8,}\d)", "", value)
+    if detect_commercial_changes(value):
+        return "Детали предложения доступны после внутренней проверки."
     return " ".join(value.split())
 
 
@@ -180,11 +183,13 @@ def get_offer_context(offer_id, db_path=None):
             """
             SELECT po.*, pr.status AS partner_request_status,
                    c.client_id, c.category, c.data AS case_data,
-                   c.status AS case_status, cl.telegram_id AS client_telegram_id
+                   c.status AS case_status, cl.telegram_id AS client_telegram_id,
+                   p.telegram_username AS partner_telegram_username
             FROM partner_offers po
             JOIN partner_requests pr ON pr.id = po.partner_request_id
             JOIN cases c ON c.id = po.case_id
             JOIN clients cl ON cl.id = c.client_id
+            JOIN partners p ON p.id = po.partner_id
             WHERE po.id = ?
             """,
             (offer_id,),
@@ -387,6 +392,11 @@ def format_client_offer(offer, case):
         lines.extend(("", "Ссылка:", str(offer["url"])))
     if offer.get("conditions"):
         lines.extend(("", "Условия:", str(offer["conditions"])))
+    current_username = str(
+        case.get("partner_telegram_username") or ""
+    ).strip().lstrip("@").strip()
+    if current_username:
+        lines.extend(("", "Контакт партнёра:", f"@{current_username}"))
     lines.extend((
         "",
         "Предложение получено от партнёра. Актуальность и доступность нужно "

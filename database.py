@@ -210,12 +210,74 @@ def _migration_005_partner_handoff(connection):
     )
 
 
+def _migration_006_partner_operating_system(connection):
+    partner_columns = _column_names(connection, "partners")
+    additions = (
+        ("partner_type", "TEXT NOT NULL DEFAULT 'service_provider'"),
+        ("allowed_actions", "TEXT NOT NULL DEFAULT '[]'"),
+        ("operational_notes", "TEXT"),
+    )
+    for name, definition in additions:
+        if name not in partner_columns:
+            connection.execute(f"ALTER TABLE partners ADD COLUMN {name} {definition}")
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS partner_approved_terms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL,
+            term_key TEXT NOT NULL,
+            term_value TEXT NOT NULL,
+            approved_by INTEGER,
+            approved_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(partner_id, term_key),
+            FOREIGN KEY (partner_id) REFERENCES partners(id)
+        );
+        CREATE TABLE IF NOT EXISTS partner_term_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending_owner_approval',
+            proposed_changes TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_message TEXT NOT NULL,
+            source_message_id INTEGER,
+            fingerprint TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            decided_at TIMESTAMP,
+            decided_by INTEGER,
+            decision_note TEXT,
+            UNIQUE(partner_id, fingerprint, status),
+            FOREIGN KEY (partner_id) REFERENCES partners(id)
+        );
+        CREATE TABLE IF NOT EXISTS partner_commercial_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL,
+            proposal_id INTEGER,
+            action TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            actor_id INTEGER,
+            details TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (partner_id) REFERENCES partners(id),
+            FOREIGN KEY (proposal_id) REFERENCES partner_term_proposals(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_partner_terms_partner
+            ON partner_approved_terms(partner_id, term_key);
+        CREATE INDEX IF NOT EXISTS idx_partner_proposals_status
+            ON partner_term_proposals(status, partner_id, id);
+        CREATE INDEX IF NOT EXISTS idx_partner_audit_partner
+            ON partner_commercial_audit(partner_id, id);
+        """
+    )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
     (3, _migration_003_indexes),
     (4, _migration_004_partner_network),
     (5, _migration_005_partner_handoff),
+    (6, _migration_006_partner_operating_system),
 )
 
 

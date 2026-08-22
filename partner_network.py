@@ -5,9 +5,16 @@ import sqlite3
 from datetime import datetime, timezone
 
 from database import get_connection
+from partner_authority import (
+    OPERATIONAL_ACTIONS,
+    create_pending_proposal,
+    get_approved_terms,
+    list_pending_proposals,
+)
 
 
 PARTNER_STATUSES = {"candidate", "active", "paused", "blocked"}
+PARTNER_TYPES = {"service_provider", "b2b_channel", "hybrid"}
 SERVICE_CATEGORIES = {
     "housing", "transfer", "car_rental", "bike_rental", "excursions",
     "boats", "fishing", "visa", "sim", "activities", "medical",
@@ -83,12 +90,18 @@ def _validate_services(services):
     return values
 
 
+def _normalize_telegram_username(username):
+    value = str(username or "").strip().lstrip("@").strip()
+    return value or None
+
+
 def _partner_from_row(row):
     if not row:
         return None
     result = dict(row)
     result["services"] = _decode_list(result.get("services"))
     result["areas"] = _decode_list(result.get("areas"))
+    result["allowed_actions"] = _decode_list(result.get("allowed_actions"))
     result.pop("invite_token_hash", None)
     return result
 
@@ -96,9 +109,12 @@ def _partner_from_row(row):
 def create_partner(
     name, services, areas=None, status="candidate", telegram_username=None,
     commission_notes=None, notes=None, db_path=None,
+    partner_type="service_provider", allowed_actions=None, operational_notes=None,
 ):
     if status not in PARTNER_STATUSES:
         raise ValueError("Недопустимый статус партнёра")
+    if partner_type not in PARTNER_TYPES:
+        raise ValueError("Недопустимый тип партнёра")
     services = _validate_services(services)
     connection = get_connection(db_path)
     try:
@@ -107,13 +123,16 @@ def create_partner(
                 """
                 INSERT INTO partners
                     (name, telegram_username, status, services, areas,
-                     commission_notes, notes, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     commission_notes, notes, updated_at, partner_type,
+                     allowed_actions, operational_notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    name.strip(), telegram_username, status,
+                    name.strip(), _normalize_telegram_username(telegram_username), status,
                     _encode_list(services), _encode_list(areas),
-                    commission_notes, notes, _now(),
+                    commission_notes, notes, _now(), partner_type,
+                    _encode_list(allowed_actions or sorted(OPERATIONAL_ACTIONS)),
+                    operational_notes,
                 ),
             )
         return get_partner(cursor.lastrowid, db_path)
@@ -128,7 +147,12 @@ def get_partner(partner_id, db_path=None):
         row = connection.execute(
             "SELECT * FROM partners WHERE id = ?", (partner_id,)
         ).fetchone()
-        return _partner_from_row(row)
+        partner = _partner_from_row(row)
+        if partner:
+            partner["approved_terms"] = get_approved_terms(partner_id, db_path)
+            partner["pending_terms"] = list_pending_proposals(partner_id, db_path)
+            partner["requires_owner_approval"] = True
+        return partner
     finally:
         connection.close()
 
@@ -138,7 +162,14 @@ def list_partners(db_path=None):
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute("SELECT * FROM partners ORDER BY id").fetchall()
-        return [_partner_from_row(row) for row in rows]
+        partners = []
+        for row in rows:
+            partner = _partner_from_row(row)
+            partner["approved_terms"] = get_approved_terms(partner["id"], db_path)
+            partner["pending_terms"] = list_pending_proposals(partner["id"], db_path)
+            partner["requires_owner_approval"] = True
+            partners.append(partner)
+        return partners
     finally:
         connection.close()
 
@@ -243,12 +274,73 @@ def onboard_partner(token, telegram_user_id, telegram_username=None, db_path=Non
                         invite_token_hash = NULL, updated_at = ?
                     WHERE id = ?
                     """,
-                    (telegram_user_id, telegram_username, _now(), row["id"]),
+                    (telegram_user_id, _normalize_telegram_username(telegram_username),
+                     _now(), row["id"]),
                 )
         except sqlite3.IntegrityError as error:
             raise PartnerUnavailableError(
                 "Telegram уже связан с другим партнёром"
             ) from error
+        return get_partner(row["id"], db_path)
+    finally:
+        connection.close()
+
+
+def sync_partner_telegram_identity(telegram_user_id, telegram_username=None,
+                                   db_path=None):
+    """Resolve by immutable Telegram ID, or link one unbound username match."""
+    user_id = int(telegram_user_id)
+    username = _normalize_telegram_username(telegram_username)
+    connection = get_connection(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT * FROM partners WHERE telegram_user_id = ?", (user_id,)
+        ).fetchone()
+        linked = False
+        if not row and username:
+            candidates = connection.execute(
+                """SELECT * FROM partners
+                   WHERE telegram_user_id IS NULL
+                     AND lower(ltrim(COALESCE(telegram_username, ''), '@')) = lower(?)
+                   ORDER BY id""",
+                (username,),
+            ).fetchall()
+            if len(candidates) == 1:
+                row = candidates[0]
+                linked = True
+        if not row:
+            return None
+
+        old_username = _normalize_telegram_username(row["telegram_username"])
+        username_changed = old_username != username
+        if linked or username_changed:
+            action = (
+                "telegram_identity_linked" if linked else
+                "telegram_username_removed" if username is None else
+                "telegram_username_updated"
+            )
+            try:
+                with connection:
+                    connection.execute(
+                        """UPDATE partners
+                           SET telegram_user_id = ?, telegram_username = ?, updated_at = ?
+                           WHERE id = ?""",
+                        (user_id, username, _now(), row["id"]),
+                    )
+                    connection.execute(
+                        """INSERT INTO partner_commercial_audit
+                           (partner_id, action, actor_type, actor_id, details)
+                           VALUES (?, ?, 'telegram_user', ?, ?)""",
+                        (row["id"], action, user_id, json.dumps({
+                            "old_username": old_username,
+                            "new_username": username,
+                        }, ensure_ascii=False)),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise PartnerUnavailableError(
+                    "Telegram уже связан с другим партнёром"
+                ) from error
         return get_partner(row["id"], db_path)
     finally:
         connection.close()
@@ -436,8 +528,11 @@ async def send_case_to_partner(case_id, partner_id, telegram_sender, db_path=Non
 
 def record_partner_reply(
     telegram_user_id, reply_to_message_id, response_text, db_path=None,
-    response_metadata=None,
+    response_metadata=None, telegram_username=None,
 ):
+    sync_partner_telegram_identity(
+        telegram_user_id, telegram_username, db_path=db_path
+    )
     connection = get_connection(db_path)
     connection.row_factory = sqlite3.Row
     try:
@@ -477,7 +572,14 @@ def record_partner_reply(
                     _now(), _now(), row["id"],
                 ),
             )
-        return get_partner_request(row["id"], db_path)
+        request = get_partner_request(row["id"], db_path)
+        request["commercial_proposal"] = create_pending_proposal(
+            request["partner_id"], response_text,
+            source="telegram_partner_reply",
+            source_message_id=reply_to_message_id,
+            db_path=db_path,
+        )
+        return request
     finally:
         connection.close()
 

@@ -14,6 +14,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     ContextTypes,
     filters,
 )
@@ -35,6 +36,7 @@ from partner_network import (
     send_case_to_partner,
     set_partner_auto_handoff,
     set_partner_status,
+    sync_partner_telegram_identity,
     update_partner,
 )
 from partner_handoff import (
@@ -71,6 +73,18 @@ from admin_ui import (
     format_partner_card,
     offer_action_buttons,
     partner_action_buttons,
+    commercial_proposal_buttons,
+    pending_proposal_list_buttons,
+    execute_commercial_decision,
+    format_commercial_proposal_card,
+)
+from partner_authority import (
+    create_pending_proposal,
+    get_proposal,
+    get_approved_terms,
+    guard_partner_response,
+    list_pending_proposals,
+    record_proposal_delivery,
 )
 
 from case_engine import (
@@ -1206,10 +1220,95 @@ async def _show_partner(query, partner_id, case_id=None):
         format_partner_card(partner),
         reply_markup=_admin_keyboard(
             partner_action_buttons(
-                partner_id, partner.get("auto_handoff_enabled"), case_id
+                partner_id, partner.get("auto_handoff_enabled"), case_id,
+                pending_count=len(partner.get("pending_terms", [])),
             )
         ),
     )
+
+
+def _format_decision_terms(changes):
+    labels = {
+        "commission": "комиссия", "discount": "скидка",
+        "payment_method": "способ оплаты", "exclusivity": "эксклюзивность",
+        "liability": "ответственность/компенсация",
+        "contractual_obligation": "договорное обязательство",
+    }
+    return "; ".join(
+        f"{labels.get(key, key)} {value}" for key, value in changes.items()
+    )
+
+
+async def _show_pending_terms(query, partner_id):
+    partner = get_partner(partner_id)
+    if not partner:
+        await query.edit_message_text("Партнёр не найден.")
+        return
+    proposals = list_pending_proposals(partner_id)
+    if not proposals:
+        await query.edit_message_text(
+            f"У партнёра «{partner['name']}» нет условий, ожидающих решения.",
+            reply_markup=_admin_keyboard([[
+                ("⬅️ Назад к партнёру", f"partner:view:{partner_id}")
+            ]]),
+        )
+        return
+    text = "⚠️ Коммерческие условия, ожидающие решения\n\n" + "\n\n".join(
+        format_commercial_proposal_card(item, partner) for item in proposals
+    )
+    await query.edit_message_text(
+        text,
+        reply_markup=_admin_keyboard(
+            pending_proposal_list_buttons(proposals, partner_id)
+        ),
+    )
+
+
+async def _show_pending_term(query, proposal_id):
+    proposal = get_proposal(proposal_id)
+    if not proposal or proposal.get("status") != "pending_owner_approval":
+        await query.edit_message_text("Предложение уже обработано или не найдено.")
+        return
+    partner = get_partner(proposal["partner_id"])
+    await query.edit_message_text(
+        format_commercial_proposal_card(proposal, partner),
+        reply_markup=_admin_keyboard(
+            commercial_proposal_buttons(proposal_id, partner["id"])
+        ),
+    )
+
+
+async def _notify_partner_owner_decision(proposal, partner, approved,
+                                         telegram_sender):
+    destination = partner.get("telegram_user_id")
+    if destination is None:
+        record_proposal_delivery(
+            proposal["id"], False, error="telegram_user_id_missing"
+        )
+        return False, "у партнёра отсутствует Telegram user ID"
+    if approved:
+        text = (
+            "Условия согласованы. Можем продолжать работу на следующих "
+            f"условиях: {_format_decision_terms(proposal['proposed_changes'])}."
+        )
+    else:
+        approved_terms = get_approved_terms(partner["id"])
+        text = (
+            "Предложенные условия не согласованы. Продолжаем работу по ранее "
+            "утверждённым условиям."
+            if approved_terms else
+            "Предложенные условия не согласованы. По дальнейшему формату "
+            "работы вернёмся отдельно."
+        )
+    try:
+        await telegram_sender(chat_id=destination, text=text)
+    except Exception as error:
+        record_proposal_delivery(
+            proposal["id"], False, error=type(error).__name__
+        )
+        return False, "Telegram не подтвердил отправку"
+    record_proposal_delivery(proposal["id"], True)
+    return True, None
 
 
 async def admin_callback_handler(update, context):
@@ -1313,6 +1412,44 @@ async def admin_callback_handler(update, context):
                 f"Запрос №{request['id']} отправлен партнёру.",
                 reply_markup=_admin_keyboard([[('⬅️ В панель', 'admin:panel')]]),
             )
+        elif parts[:2] == ["terms", "list"]:
+            await _show_pending_terms(query, int(parts[2]))
+        elif parts[:2] == ["terms", "view"]:
+            await _show_pending_term(query, int(parts[2]))
+        elif parts[:2] == ["terms", "approve"]:
+            proposal = execute_commercial_decision(
+                int(parts[2]), True, owner_id=update.effective_user.id
+            )
+            partner = get_partner(proposal["partner_id"])
+            delivered, delivery_error = await _notify_partner_owner_decision(
+                proposal, partner, True, context.bot.send_message
+            )
+            delivery_status = (
+                "Партнёр уведомлён."
+                if delivered else f"Партнёр не уведомлён: {delivery_error}."
+            )
+            await query.edit_message_text(
+                f"✅ Новые условия партнёра «{partner['name']}» утверждены владельцем.\n\n"
+                + delivery_status,
+                reply_markup=_admin_keyboard([[("🤝 Посмотреть партнёра", f"partner:view:{partner['id']}")]]),
+            )
+        elif parts[:2] == ["terms", "reject"]:
+            proposal = execute_commercial_decision(
+                int(parts[2]), False, owner_id=update.effective_user.id
+            )
+            partner = get_partner(proposal["partner_id"])
+            delivered, delivery_error = await _notify_partner_owner_decision(
+                proposal, partner, False, context.bot.send_message
+            )
+            delivery_status = (
+                "Партнёр уведомлён."
+                if delivered else f"Партнёр не уведомлён: {delivery_error}."
+            )
+            await query.edit_message_text(
+                f"❌ Новые условия партнёра «{partner['name']}» отклонены. "
+                "Утверждённые условия не изменены.\n\n" + delivery_status,
+                reply_markup=_admin_keyboard([[("🤝 Посмотреть партнёра", f"partner:view:{partner['id']}")]]),
+            )
     except AdminCaseNotFoundError:
         await query.edit_message_text("Кейс не найден.")
     except DuplicateOfferSendError:
@@ -1344,16 +1481,23 @@ async def partner_reply_handler(update, context):
         message.reply_to_message.message_id,
         response_text,
         response_metadata=metadata,
+        telegram_username=update.effective_user.username,
     )
     if not request:
         return
-    await message.reply_text("Ответ сохранён в Phuket Life.")
+    proposal = request.get("commercial_proposal")
+    acknowledgement = "Ответ сохранён в Phuket Life."
+    if proposal:
+        acknowledgement = guard_partner_response(
+            "Согласны, договорились.", has_unapproved_terms=True
+        )
+    await message.reply_text(acknowledgement)
     admin_id = SETTINGS.telegram_admin_user_id
     partner = get_partner(request["partner_id"])
     offer = None
     auto_send_succeeded = False
     auto_send_failed = False
-    if request["status"] == "responded":
+    if request["status"] == "responded" and not proposal:
         try:
             offer = create_offer_from_partner_response(
                 request["id"], SETTINGS.partner_handoff_mode
@@ -1369,7 +1513,9 @@ async def partner_reply_handler(update, context):
         except OfferHandoffError:
             offer = None
     if admin_id:
-        if auto_send_succeeded:
+        if proposal:
+            notification = format_commercial_proposal_card(proposal, partner)
+        elif auto_send_succeeded:
             notification = (
                 "✅ Новый ответ партнёра\n\n"
                 f"Предложение №{offer['id']} проверено и отправлено клиенту."
@@ -1395,7 +1541,11 @@ async def partner_reply_handler(update, context):
             )
         try:
             reply_markup = None
-            if offer and not auto_send_succeeded:
+            if proposal:
+                reply_markup = _admin_keyboard(
+                    commercial_proposal_buttons(proposal["id"], partner["id"])
+                )
+            elif offer and not auto_send_succeeded:
                 reply_markup = _admin_keyboard(
                     offer_action_buttons(
                         offer["id"], offer["case_id"], offer["partner_id"]
@@ -1406,6 +1556,50 @@ async def partner_reply_handler(update, context):
             )
         except Exception as error:
             print("[PARTNER] Admin notification failed: " + type(error).__name__)
+    raise ApplicationHandlerStop
+
+
+async def partner_identity_sync_handler(update, context):
+    user = update.effective_user
+    if not user:
+        return
+    partner = sync_partner_telegram_identity(user.id, user.username)
+    message = update.effective_message
+    if not partner or partner.get("status") != "active" or not message:
+        return
+
+    response_text = message.text or message.caption or ""
+    if response_text.lstrip().startswith("/"):
+        return
+    proposal = create_pending_proposal(
+        partner["id"], response_text, source="telegram_partner_message",
+        source_message_id=message.message_id,
+    )
+    if proposal:
+        await message.reply_text(guard_partner_response(
+            "Согласны.", has_unapproved_terms=True
+        ))
+        admin_id = SETTINGS.telegram_admin_user_id
+        if admin_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=format_commercial_proposal_card(
+                        proposal, get_partner(partner["id"])
+                    ),
+                    reply_markup=_admin_keyboard(
+                        commercial_proposal_buttons(proposal["id"], partner["id"])
+                    ),
+                )
+            except Exception as error:
+                print("[PARTNER] Admin notification failed: " + type(error).__name__)
+        raise ApplicationHandlerStop
+
+    if message.reply_to_message:
+        return
+    await message.reply_text(
+        "Спасибо, сообщение получили и передали в партнёрский контур Phuket Life."
+    )
     raise ApplicationHandlerStop
 
 
@@ -1924,8 +2118,13 @@ def main():
     app.add_handler(
         CallbackQueryHandler(
             admin_callback_handler,
-            pattern=r"^(admin|case|offer|partner):",
+            pattern=r"^(admin|case|offer|partner|terms):",
         )
+    )
+
+    app.add_handler(
+        TypeHandler(Update, partner_identity_sync_handler),
+        group=-2,
     )
 
     app.add_handler(
