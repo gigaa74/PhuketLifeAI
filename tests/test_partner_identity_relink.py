@@ -166,29 +166,40 @@ class LeraIdentityRepairTests(unittest.TestCase):
         connection = get_connection(self.db_path)
         try:
             with connection:
-                for partner_id, name in ((1, "One"), (2, "Two"), (4, "Four"), (5, "Five")):
+                connection.execute(
+                    """INSERT INTO partners(id,name,status,telegram_user_id,telegram_username)
+                       VALUES(1,'Test Partner','blocked',6233935382,'GIGAA74')"""
+                )
+                connection.execute(
+                    """INSERT INTO partners(id,name,status,telegram_user_id,telegram_username)
+                       VALUES(2,'Test Partner 2','active',8733594703,'gigaaa74')"""
+                )
+                connection.execute(
+                    """INSERT INTO partners
+                       (id,name,status,partner_type,telegram_user_id,telegram_username,
+                        services,areas,allowed_actions,operational_notes,auto_handoff_enabled)
+                       VALUES(3,'Лера','active','hybrid',1905717582,'lerikaDi',
+                              '["housing"]','["Karon"]','["receive_requests"]',
+                              '{"direction":"жильё"}',1)"""
+                )
+                for partner_id, name in ((4, "Инна"), (5, "Сергей")):
                     connection.execute(
                         "INSERT INTO partners(id,name,status) VALUES(?,?,'active')",
                         (partner_id, name),
                     )
                 connection.execute(
                     """INSERT INTO partners
-                       (id,name,status,partner_type,telegram_user_id,telegram_username,
-                        services,areas,operational_notes)
-                       VALUES(3,'Лера','active','hybrid',1905717582,'lerikaDi',
-                              '["housing"]','["Karon"]','notes')"""
-                )
-                connection.execute(
-                    """INSERT INTO partners
-                       (id,name,status,telegram_user_id,telegram_username,contacts)
-                       VALUES(6,'Валерия','active',8502972477,NULL,'@Hereld')"""
+                       (id,name,status,telegram_user_id,telegram_username,contacts,
+                        notes,operational_notes,services,areas)
+                       VALUES(6,'Валерия','active',8502972477,NULL,'@Hereld',
+                              'обслуживание квартир','рабочие районы',
+                              '["other"]','["Phuket"]')"""
                 )
                 for index in range(7):
                     connection.execute(
                         """INSERT INTO partner_approved_terms
-                           (partner_id,term_key,term_value) VALUES(3,?,?,?)""".replace(
-                            "VALUES(3,?,?,?)", "VALUES(3,?,?)"
-                        ), (f"term_{index}", str(index)),
+                           (partner_id,term_key,term_value) VALUES(3,?,?)""",
+                        (f"term_{index}", str(index)),
                     )
                 for _ in range(2):
                     connection.execute(
@@ -198,9 +209,56 @@ class LeraIdentityRepairTests(unittest.TestCase):
                 connection.execute(
                     """INSERT INTO partner_applications
                        (id,telegram_user_id,telegram_username,contact_text,status,
-                        current_step,partner_id)
-                       VALUES(1,8502972477,'Hereld','@Hereld','approved','complete',6)"""
+                        current_step,partner_id,services_text,areas_text)
+                       VALUES(1,8502972477,'Hereld','@Hereld','approved','complete',6,
+                              'обслуживание квартир','Пхукет')"""
                 )
+                connection.execute(
+                    """INSERT INTO partner_approved_terms
+                       (partner_id,term_key,term_value)
+                       VALUES(2,'commission','15%')"""
+                )
+                connection.execute("INSERT INTO clients(telegram_id) VALUES(700001)")
+                client_id = connection.execute(
+                    "SELECT id FROM clients WHERE telegram_id=700001"
+                ).fetchone()[0]
+                connection.execute(
+                    "INSERT INTO cases(client_id,status) VALUES(?,'new')", (client_id,)
+                )
+                case_id = connection.execute(
+                    "SELECT id FROM cases WHERE client_id=?", (client_id,)
+                ).fetchone()[0]
+                request_ids = []
+                for index in range(3):
+                    cursor = connection.execute(
+                        """INSERT INTO partner_requests
+                           (case_id,partner_id,service_category,status,request_payload)
+                           VALUES(?,2,?,'responded','{}')""",
+                        (case_id, f"test_{index}"),
+                    )
+                    request_ids.append(cursor.lastrowid)
+                connection.execute(
+                    """INSERT INTO partner_offers
+                       (partner_request_id,case_id,partner_id,raw_partner_response)
+                       VALUES(?,?,2,'test offer')""",
+                    (request_ids[0], case_id),
+                )
+                proposal_ids = []
+                for index in range(2):
+                    cursor = connection.execute(
+                        """INSERT INTO partner_term_proposals
+                           (partner_id,status,proposed_changes,source,source_message,fingerprint)
+                           VALUES(2,'pending_owner_approval','{}','test','test',?)""",
+                        (f"fingerprint-{index}",),
+                    )
+                    proposal_ids.append(cursor.lastrowid)
+                for index in range(7):
+                    connection.execute(
+                        """INSERT INTO partner_commercial_audit
+                           (partner_id,proposal_id,action,actor_type)
+                           VALUES(2,?,'test','owner')""",
+                        (proposal_ids[index % 2],),
+                    )
         finally:
             connection.close()
 
@@ -208,23 +266,63 @@ class LeraIdentityRepairTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_repair_dry_run_apply_and_idempotency(self):
+        connection = get_connection(self.db_path)
+        try:
+            others_before = connection.execute(
+                "SELECT * FROM partners WHERE id IN (4,5) ORDER BY id"
+            ).fetchall()
+            clients_before = connection.execute("SELECT * FROM clients ORDER BY id").fetchall()
+            cases_before = connection.execute("SELECT * FROM cases ORDER BY id").fetchall()
+            terms_before = connection.execute(
+                "SELECT COUNT(*) FROM partner_approved_terms"
+            ).fetchone()[0]
+        finally:
+            connection.close()
         dry = repair_lera_identity(self.db_path, dry_run=True)
         self.assertTrue(dry["changed"])
-        self.assertIsNotNone(get_partner(6, self.db_path))
+        self.assertEqual(dry["partner_id"], 6)
+        self.assertEqual(dry["delete_partner_ids"], [1, 2, 3])
         applied = repair_lera_identity(self.db_path, dry_run=False)
         repeated = repair_lera_identity(self.db_path, dry_run=False)
         self.assertTrue(applied["changed"])
         self.assertFalse(repeated["changed"])
-        lera = get_partner(3, self.db_path)
+        lera = get_partner(6, self.db_path)
         self.assertEqual(lera["telegram_user_id"], 8502972477)
         self.assertEqual(lera["telegram_username"], "Hereld")
-        self.assertIsNone(get_partner(6, self.db_path))
+        self.assertEqual(lera["name"], "Валерия")
+        self.assertIsNone(get_partner(3, self.db_path))
+        self.assertIsNone(get_partner(1, self.db_path))
+        self.assertIsNone(get_partner(2, self.db_path))
         self.assertEqual(len(lera["approved_terms"]), 7)
         connection = get_connection(self.db_path)
         try:
             self.assertEqual(connection.execute(
                 "SELECT partner_id FROM partner_applications WHERE id=1"
+            ).fetchone()[0], 6)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM partner_commercial_audit WHERE partner_id=6"
+            ).fetchone()[0], 2)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM partners"
             ).fetchone()[0], 3)
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM partner_requests WHERE partner_id IN (1,2,3)"
+            ).fetchone())
+            self.assertIsNone(connection.execute("PRAGMA foreign_key_check").fetchone())
+            self.assertEqual(connection.execute(
+                "SELECT * FROM partners WHERE id IN (4,5) ORDER BY id"
+            ).fetchall(), others_before)
+            self.assertEqual(
+                connection.execute("SELECT * FROM clients ORDER BY id").fetchall(),
+                clients_before,
+            )
+            self.assertEqual(
+                connection.execute("SELECT * FROM cases ORDER BY id").fetchall(),
+                cases_before,
+            )
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM partner_approved_terms"
+            ).fetchone()[0], terms_before - 1)
         finally:
             connection.close()
 
@@ -250,49 +348,39 @@ class LeraIdentityRepairTests(unittest.TestCase):
                        FOREIGN KEY(partner_id) REFERENCES partners(id))"""
                 )
                 connection.execute(
-                    "INSERT INTO unexpected_partner_link(partner_id) VALUES(6)"
+                    "INSERT INTO unexpected_partner_link(partner_id) VALUES(3)"
                 )
         finally:
             connection.close()
         with self.assertRaises(LeraRepairConflict):
             repair_lera_identity(self.db_path, dry_run=False)
-        self.assertIsNotNone(get_partner(6, self.db_path))
+        self.assertIsNotNone(get_partner(3, self.db_path))
         self.assertEqual(get_partner(3, self.db_path)["telegram_user_id"], 1905717582)
 
     def test_repair_rolls_back_everything_on_dependency_collision(self):
         connection = get_connection(self.db_path)
         try:
             with connection:
+                case_id = connection.execute("SELECT id FROM cases LIMIT 1").fetchone()[0]
                 connection.execute(
-                    "INSERT INTO clients(telegram_id) VALUES(700001)"
+                    """INSERT INTO partner_requests
+                       (case_id,partner_id,service_category,status,request_payload)
+                       VALUES(?,6,'collision','created','{}')""", (case_id,)
                 )
-                client_id = connection.execute(
-                    "SELECT id FROM clients WHERE telegram_id=700001"
-                ).fetchone()[0]
                 connection.execute(
-                    "INSERT INTO cases(client_id,status) VALUES(?,'new')",
-                    (client_id,),
+                    """INSERT INTO partner_requests
+                       (case_id,partner_id,service_category,status,request_payload)
+                       VALUES(?,3,'collision','created','{}')""", (case_id,)
                 )
-                case_id = connection.execute(
-                    "SELECT id FROM cases WHERE client_id=?", (client_id,)
-                ).fetchone()[0]
-                for partner_id in (3, 6):
-                    connection.execute(
-                        """INSERT INTO partner_requests
-                           (case_id,partner_id,service_category,status,request_payload)
-                           VALUES(?,?,'housing','created','{}')""",
-                        (case_id, partner_id),
-                    )
         finally:
             connection.close()
         with self.assertRaises(LeraRepairConflict):
             repair_lera_identity(self.db_path, dry_run=False)
-        canonical = get_partner(3, self.db_path)
-        duplicate = get_partner(6, self.db_path)
-        self.assertEqual(canonical["telegram_user_id"], 1905717582)
-        self.assertEqual(canonical["telegram_username"], "lerikaDi")
-        self.assertEqual(duplicate["telegram_user_id"], 8502972477)
-        self.assertIsNone(duplicate["telegram_username"])
+        donor = get_partner(3, self.db_path)
+        canonical = get_partner(6, self.db_path)
+        self.assertEqual(donor["telegram_user_id"], 1905717582)
+        self.assertEqual(canonical["telegram_user_id"], 8502972477)
+        self.assertIsNone(canonical["telegram_username"])
 
 
 if __name__ == "__main__":
