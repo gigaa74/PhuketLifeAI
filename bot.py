@@ -99,8 +99,19 @@ from partner_applications import (
     get_application,
     get_open_application,
     list_applications,
+    move_application_back,
     record_application_answer,
+    skip_application_step,
     start_application,
+)
+from partner_identity_relinks import (
+    PartnerIdentityRelinkError,
+    cancel_relink,
+    decide_relink,
+    get_open_relink,
+    get_relink,
+    record_relink_answer,
+    start_relink,
 )
 from partner_referrals import (
     PartnerReferralError,
@@ -828,15 +839,19 @@ def build_search_confirmation(
 
 PARTNER_START_WELCOME = """{name}, здравствуйте! 👋
 
-Ваш Telegram успешно подключён к партнёрской системе Phuket Life.
+Ваш рабочий Telegram подключён к партнёрской системе Phuket Life.
 
-Теперь бот распознаёт Вас как партнёра. Здесь Вы сможете:
-— передавать актуальную информацию по объектам и услугам;
-— получать запросы, которые владелец Phuket Life предварительно одобрил;
-— сообщать об изменениях условий;
-— получать подтверждения по совместной работе.
+Как мы работаем:
 
-Коммерческие условия не изменяются автоматически: любые новые условия сначала направляются владельцу Phuket Life на утверждение.
+— Вы можете отправить сюда запрос клиента своими словами;
+— желательно указать даты, количество людей, бюджет, район и важные пожелания;
+— бот сохранит запрос и передаст его владельцу Phuket Life;
+— если потребуются дополнительные данные, мы сообщим Вам;
+— после проверки мы вернёмся с решением или следующим шагом.
+
+Также здесь можно сообщать об изменении услуг, цен, наличия и условий работы.
+
+Коммерческие условия не меняются автоматически: любые новые договорённости сначала подтверждает владелец Phuket Life.
 
 Подключение завершено ✅"""
 
@@ -879,7 +894,19 @@ APPLICATION_QUESTIONS = {
     "name": "Представьтесь, пожалуйста: укажите Ваше имя или название компании.",
     "services": "Какие услуги Вы предлагаете?",
     "areas": "В каких районах Вы работаете?",
+    "delivery_model": "Какие услуги Вы оказываете самостоятельно, а какие через партнёров?",
+    "live_source": "Где смотреть актуальные предложения, цены и наличие?",
+    "availability_confirmation": "Как подтверждаются цены и доступность?",
+    "request_requirements": "Какие минимальные данные нужны в запросе клиента?",
+    "commercial_model": "Какая у Вас обычная коммерческая модель или комиссия?",
     "contact": "Укажите удобный контакт для связи.",
+    "links": "Пришлите ссылки на сайт, канал, каталог, отзывы или соцсети.",
+    "licenses": "Укажите необходимые лицензии или разрешения для регулируемых услуг.",
+}
+
+RELINK_QUESTIONS = {
+    "partner_name": "Укажите имя партнёра или название компании, с которыми уже сотрудничает Phuket Life.",
+    "previous_contact": "Укажите прежний Telegram username или другой известный контакт.",
 }
 
 
@@ -892,10 +919,29 @@ def _role_choice_keyboard():
     ])
 
 
-def _application_cancel_keyboard():
+def _application_cancel_keyboard(step=None):
+    navigation = [InlineKeyboardButton("⬅️ Назад", callback_data="role:app_back")]
+    if step not in {"name", "services", "contact"}:
+        navigation.append(InlineKeyboardButton(
+            "Пропустить", callback_data="role:app_skip"
+        ))
+    return InlineKeyboardMarkup([
+        navigation,
+        [InlineKeyboardButton("Отменить заполнение", callback_data="role:cancel")],
+    ])
+
+
+def _relink_cancel_keyboard():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("Отменить заполнение", callback_data="role:cancel")
     ]])
+
+
+def _partner_path_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 Я новый партнёр", callback_data="role:partner_new")],
+        [InlineKeyboardButton("🔄 Я уже сотрудничаю, но сменил аккаунт", callback_data="role:partner_relink")],
+    ])
 
 
 async def _notify_owner_identity_conflict(update, context):
@@ -966,6 +1012,16 @@ async def start(
         return
 
     application = get_open_application(update.effective_user.id)
+    relink = get_open_relink(update.effective_user.id)
+    if relink and relink["status"] == "needs_review":
+        await update.message.reply_text(APPLICATION_UNDER_REVIEW)
+        return
+    if relink and relink["status"] == "collecting":
+        await update.message.reply_text(
+            RELINK_QUESTIONS[relink["current_step"]],
+            reply_markup=_relink_cancel_keyboard(),
+        )
+        return
     if application:
         application, _ = start_application(
             update.effective_user.id, update.effective_user.username
@@ -976,7 +1032,7 @@ async def start(
     if application and application["status"] == "collecting":
         await update.message.reply_text(
             APPLICATION_QUESTIONS[application["current_step"]],
-            reply_markup=_application_cancel_keyboard(),
+            reply_markup=_application_cancel_keyboard(application["current_step"]),
         )
         return
 
@@ -1016,16 +1072,55 @@ async def role_choice_callback_handler(update, context):
         get_or_create_client(update)
         await query.edit_message_text(CLIENT_START_WELCOME)
         return
+    if query.data == "role:partner":
+        await query.edit_message_text(
+            "Уточните, пожалуйста, Вашу ситуацию:",
+            reply_markup=_partner_path_keyboard(),
+        )
+        return
     if query.data == "role:cancel":
         cancelled = cancel_application(user.id)
+        relink_cancelled = cancel_relink(user.id)
         context.user_data.pop("partner_application_id", None)
         text = (
             "Заполнение заявки отменено."
-            if cancelled and cancelled.get("status") == "cancelled"
+            if ((cancelled and cancelled.get("status") == "cancelled") or
+                (relink_cancelled and relink_cancelled.get("status") == "cancelled"))
             else "Активной заявки для отмены нет."
         )
         await query.edit_message_text(
             text, reply_markup=_role_choice_keyboard()
+        )
+        return
+    if query.data == "role:partner_relink":
+        relink, _ = start_relink(user.id, user.username)
+        context.user_data["partner_relink_id"] = relink["id"]
+        await query.edit_message_text(
+            RELINK_QUESTIONS[relink["current_step"]],
+            reply_markup=_relink_cancel_keyboard(),
+        )
+        return
+    if query.data in ("role:app_back", "role:app_skip"):
+        application = get_open_application(user.id)
+        if not application or application["status"] != "collecting":
+            await query.edit_message_text("Активная заявка не найдена.")
+            return
+        application = (
+            move_application_back(application["id"])
+            if query.data == "role:app_back" else
+            skip_application_step(application["id"])
+        )
+        if application["status"] == "needs_review":
+            context.user_data.pop("partner_application_id", None)
+            await query.edit_message_text(
+                "Спасибо! Ваша заявка передана владельцу Phuket Life на рассмотрение. "
+                "Партнёрские права пока не предоставлены."
+            )
+            await _send_partner_application_to_owner(application, context)
+            return
+        await query.edit_message_text(
+            APPLICATION_QUESTIONS[application["current_step"]],
+            reply_markup=_application_cancel_keyboard(application["current_step"]),
         )
         return
     application, _ = start_application(user.id, user.username)
@@ -1035,7 +1130,7 @@ async def role_choice_callback_handler(update, context):
     context.user_data["partner_application_id"] = application["id"]
     await query.edit_message_text(
         APPLICATION_QUESTIONS[application["current_step"]],
-        reply_markup=_application_cancel_keyboard(),
+        reply_markup=_application_cancel_keyboard(application["current_step"]),
     )
 
 
@@ -1046,10 +1141,34 @@ def _format_partner_application(application):
         f"Имя / компания: {application.get('applicant_name') or '—'}\n"
         f"Услуги: {application.get('services_text') or '—'}\n"
         f"Районы: {application.get('areas_text') or '—'}\n"
+        f"Самостоятельно / через партнёров: {application.get('delivery_model_text') or '—'}\n"
+        f"Источник предложений: {application.get('live_source_text') or '—'}\n"
+        f"Подтверждение цен и наличия: {application.get('availability_confirmation_text') or '—'}\n"
+        f"Требования к запросу: {application.get('request_requirements_text') or '—'}\n"
+        f"Коммерческая модель: {application.get('commercial_model_text') or '—'}\n"
         f"Контакт: {application.get('contact_text') or '—'}\n"
+        f"Ссылки: {application.get('links_text') or '—'}\n"
+        f"Лицензии / разрешения: {application.get('licenses_text') or '—'}\n"
         f"Username: {'@' + username if username else 'не указан'}\n"
         f"Статус: {application.get('status')}"
     )
+
+
+async def _send_partner_application_to_owner(application, context):
+    admin_id = SETTINGS.telegram_admin_user_id
+    if admin_id is None:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=_format_partner_application(application),
+            reply_markup=_admin_keyboard([[
+                ("✅ Утвердить", f"application:approve:{application['id']}"),
+                ("❌ Отклонить", f"application:reject:{application['id']}"),
+            ]]),
+        )
+    except Exception as error:
+        print("[PARTNER_APPLICATION] Owner notification failed: " + type(error).__name__)
 
 
 async def partner_application_message_handler(update, context):
@@ -1057,6 +1176,46 @@ async def partner_application_message_handler(update, context):
     user = update.effective_user
     if not message or not user or not message.text:
         return
+    relink = get_open_relink(user.id)
+    if relink and relink["status"] == "collecting":
+        relink = record_relink_answer(relink["id"], message.text)
+        if relink["status"] == "collecting":
+            await message.reply_text(
+                RELINK_QUESTIONS[relink["current_step"]],
+                reply_markup=_relink_cancel_keyboard(),
+            )
+            raise ApplicationHandlerStop
+        await message.reply_text(
+            "Запрос на смену рабочего Telegram передан владельцу Phuket Life. "
+            "До подтверждения партнёрские права не предоставлены."
+        )
+        admin_id = SETTINGS.telegram_admin_user_id
+        if admin_id is not None:
+            partners = [
+                partner for partner in list_partners()
+                if partner.get("status") == "active"
+            ]
+            buttons = [[(
+                f"Выбрать: {partner['name']}",
+                f"relink:select:{relink['id']}:{partner['id']}",
+            )] for partner in partners]
+            buttons.append([("❌ Отклонить", f"relink:reject:{relink['id']}:0")])
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "🔄 Запрос на смену рабочего Telegram\n\n"
+                        f"Новый user ID: {relink['telegram_user_id']}\n"
+                        f"Новый username: @{relink['telegram_username'] or 'не указан'}\n"
+                        f"Партнёр: {relink['partner_name_text']}\n"
+                        f"Прежний контакт: {relink['previous_contact_text']}\n"
+                        "Выберите существующую партнёрскую запись."
+                    ),
+                    reply_markup=_admin_keyboard(buttons),
+                )
+            except Exception as error:
+                print("[PARTNER_RELINK] Owner notification failed: " + type(error).__name__)
+        raise ApplicationHandlerStop
     application = get_open_application(user.id)
     if not application or application["status"] != "collecting":
         return
@@ -1066,7 +1225,7 @@ async def partner_application_message_handler(update, context):
         context.user_data["partner_application_id"] = application["id"]
         await message.reply_text(
             APPLICATION_QUESTIONS[application["current_step"]],
-            reply_markup=_application_cancel_keyboard(),
+            reply_markup=_application_cancel_keyboard(application["current_step"]),
         )
         raise ApplicationHandlerStop
     context.user_data.pop("partner_application_id", None)
@@ -1074,16 +1233,7 @@ async def partner_application_message_handler(update, context):
         "Спасибо! Ваша заявка передана владельцу Phuket Life на рассмотрение. "
         "Партнёрские права пока не предоставлены."
     )
-    admin_id = SETTINGS.telegram_admin_user_id
-    if admin_id is not None:
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=_format_partner_application(application),
-            reply_markup=_admin_keyboard([[
-                ("✅ Утвердить", f"application:approve:{application['id']}"),
-                ("❌ Отклонить", f"application:reject:{application['id']}"),
-            ]]),
-        )
+    await _send_partner_application_to_owner(application, context)
     raise ApplicationHandlerStop
 
 
@@ -1859,6 +2009,43 @@ async def admin_callback_handler(update, context):
                 _format_partner_referral_owner(referral, partner),
                 reply_markup=_partner_referral_buttons(referral["id"]),
             )
+        elif parts[:2] == ["relink", "select"]:
+            request = get_relink(int(parts[2]))
+            partner = get_partner(int(parts[3]))
+            if not request or not partner:
+                raise PartnerIdentityRelinkError("Запрос или партнёр не найден")
+            await query.edit_message_text(
+                "⚠️ Смена primary Telegram identity\n\n"
+                f"Партнёр: {partner['name']}\n"
+                f"Прежний user ID: {partner.get('telegram_user_id') or 'не указан'}\n"
+                f"Прежний username: @{partner.get('telegram_username') or 'не указан'}\n"
+                f"Новый user ID: {request['telegram_user_id']}\n"
+                f"Новый username: @{request.get('telegram_username') or 'не указан'}\n"
+                "После подтверждения старый Telegram потеряет партнёрский доступ.",
+                reply_markup=_admin_keyboard([[
+                    ("✅ Подтвердить смену", f"relink:confirm:{request['id']}:{partner['id']}"),
+                    ("❌ Отклонить", f"relink:reject:{request['id']}:{partner['id']}"),
+                ]]),
+            )
+        elif parts[:2] in (["relink", "confirm"], ["relink", "reject"]):
+            approved = parts[1] == "confirm"
+            request = decide_relink(
+                int(parts[2]), int(parts[3]), approved, update.effective_user.id
+            )
+            if approved:
+                partner = get_partner(request["selected_partner_id"])
+                text = "✅ Смена рабочего Telegram подтверждена."
+                try:
+                    await context.bot.send_message(
+                        chat_id=request["telegram_user_id"],
+                        text=PARTNER_START_WELCOME.format(name=partner["name"]),
+                    )
+                except Exception as error:
+                    print("[PARTNER_RELINK] Welcome delivery failed: " + type(error).__name__)
+                    text += " Приветствие доставить не удалось."
+            else:
+                text = "❌ Смена рабочего Telegram отклонена. Права не предоставлены."
+            await query.edit_message_text(text)
         elif parts[:2] == ["application", "view"]:
             application = get_application(int(parts[2]))
             if not application:
@@ -1887,8 +2074,9 @@ async def admin_callback_handler(update, context):
                 await context.bot.send_message(
                     chat_id=application["telegram_user_id"],
                     text=(
-                        "Ваша заявка на партнёрство утверждена. Теперь бот "
-                        "распознаёт Вас как партнёра."
+                        PARTNER_START_WELCOME.format(
+                            name=get_partner(application["partner_id"])["name"]
+                        )
                         if approved else
                         "Ваша заявка на партнёрство отклонена. Партнёрские "
                         "права не предоставлены."
@@ -1909,7 +2097,8 @@ async def admin_callback_handler(update, context):
     except (OfferTelegramError, PartnerTelegramError):
         await query.edit_message_text("Telegram не подтвердил отправку. Попробуйте ещё раз.")
     except (OfferHandoffError, PartnerNetworkError,
-            PartnerApplicationError, PartnerReferralError) as error:
+            PartnerApplicationError, PartnerReferralError,
+            PartnerIdentityRelinkError) as error:
         await query.edit_message_text(f"Не удалось выполнить действие: {error}")
 
 
@@ -2625,14 +2814,14 @@ def main():
     app.add_handler(
         CallbackQueryHandler(
             role_choice_callback_handler,
-            pattern=r"^role:(client|partner|cancel)$",
+            pattern=r"^role:(client|partner|partner_new|partner_relink|app_back|app_skip|cancel)$",
         )
     )
 
     app.add_handler(
         CallbackQueryHandler(
             admin_callback_handler,
-            pattern=r"^(admin|case|offer|partner|terms|application|referral):",
+            pattern=r"^(admin|case|offer|partner|terms|application|referral|relink):",
         )
     )
 

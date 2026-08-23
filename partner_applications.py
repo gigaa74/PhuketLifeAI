@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -12,7 +13,12 @@ from partner_network import (
 )
 
 
-APPLICATION_STEPS = ("name", "services", "areas", "contact")
+APPLICATION_STEPS = (
+    "name", "services", "areas", "delivery_model", "live_source",
+    "availability_confirmation", "request_requirements",
+    "commercial_model", "contact", "links", "licenses",
+)
+REQUIRED_APPLICATION_STEPS = {"name", "services", "contact"}
 
 
 class PartnerApplicationError(RuntimeError):
@@ -105,7 +111,13 @@ def record_application_answer(application_id, value, db_path=None):
         raise PartnerApplicationError("Неизвестный шаг заявки")
     column = {
         "name": "applicant_name", "services": "services_text",
-        "areas": "areas_text", "contact": "contact_text",
+        "areas": "areas_text", "delivery_model": "delivery_model_text",
+        "live_source": "live_source_text",
+        "availability_confirmation": "availability_confirmation_text",
+        "request_requirements": "request_requirements_text",
+        "commercial_model": "commercial_model_text",
+        "contact": "contact_text", "links": "links_text",
+        "licenses": "licenses_text",
     }[step]
     index = APPLICATION_STEPS.index(step)
     next_step = (
@@ -129,6 +141,38 @@ def record_application_answer(application_id, value, db_path=None):
                         WHERE id=? AND status='collecting'""",
                     (text, _now(), _now(), application["id"]),
                 )
+    finally:
+        connection.close()
+    return get_application(application["id"], db_path)
+
+
+def skip_application_step(application_id, db_path=None):
+    application = get_application(application_id, db_path)
+    if not application or application["status"] != "collecting":
+        raise PartnerApplicationError("Заявка не находится в заполнении")
+    if application["current_step"] in REQUIRED_APPLICATION_STEPS:
+        raise PartnerApplicationError("Этот вопрос нельзя пропустить")
+    return record_application_answer(application_id, "не указано", db_path)
+
+
+def move_application_back(application_id, db_path=None):
+    application = get_application(application_id, db_path)
+    if not application or application["status"] != "collecting":
+        raise PartnerApplicationError("Заявка не находится в заполнении")
+    step = application["current_step"]
+    if step not in APPLICATION_STEPS:
+        raise PartnerApplicationError("Неизвестный шаг заявки")
+    index = APPLICATION_STEPS.index(step)
+    if index == 0:
+        return application
+    connection = get_connection(db_path)
+    try:
+        with connection:
+            connection.execute(
+                """UPDATE partner_applications SET current_step=?, updated_at=?
+                   WHERE id=? AND status='collecting'""",
+                (APPLICATION_STEPS[index - 1], _now(), application["id"]),
+            )
     finally:
         connection.close()
     return get_application(application["id"], db_path)
@@ -191,10 +235,22 @@ def decide_application(application_id, approved, owner_id, note=None,
                 application["applicant_name"], ["other"],
                 areas=application["areas_text"], status="candidate",
                 telegram_username=application["telegram_username"],
-                notes=(
-                    f"Заявленные услуги: {application['services_text']}\n"
-                    f"Контакт: {application['contact_text']}"
-                ),
+                operational_notes=json.dumps({
+                    "application_answers": {
+                        key: application.get(key) for key in (
+                            "services_text", "areas_text",
+                            "delivery_model_text", "live_source_text",
+                            "availability_confirmation_text",
+                            "request_requirements_text",
+                            "commercial_model_text", "contact_text",
+                            "links_text", "licenses_text",
+                        )
+                    },
+                    "approved_terms": {},
+                    "open_questions": [
+                        "Коммерческие условия требуют явного подтверждения владельца"
+                    ],
+                }, ensure_ascii=False),
                 db_path=db_path,
             )
             try:

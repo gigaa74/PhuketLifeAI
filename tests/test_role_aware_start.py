@@ -18,8 +18,14 @@ from partner_applications import (
     get_application,
     get_open_application,
     list_applications,
+    move_application_back,
     record_application_answer,
+    skip_application_step,
     start_application,
+)
+from partner_identity_relinks import (
+    cancel_relink, decide_relink, get_open_relink, get_relink,
+    record_relink_answer, start_relink,
 )
 from partner_network import (
     get_partner,
@@ -30,6 +36,11 @@ from scripts.onboard_lera_partner import onboard_lera
 
 
 class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
+    APPLICATION_ANSWERS = (
+        "Компания", "Трансферы", "Пхукет", "Самостоятельно", "Каталог",
+        "По запросу", "Даты и бюджет", "Процент", "@applicant",
+        "https://example.com", "не требуются",
+    )
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "role-aware-start.db"
@@ -118,6 +129,30 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
                 "record_application_answer": lambda app_id, value: record_application_answer(
                     app_id, value, self.db_path
                 ),
+                "move_application_back": lambda app_id: move_application_back(
+                    app_id, self.db_path
+                ),
+                "skip_application_step": lambda app_id: skip_application_step(
+                    app_id, self.db_path
+                ),
+                "get_open_relink": lambda user_id: get_open_relink(
+                    user_id, self.db_path
+                ),
+                "get_relink": lambda request_id: get_relink(
+                    request_id, self.db_path
+                ),
+                "start_relink": lambda user_id, username: start_relink(
+                    user_id, username, self.db_path
+                ),
+                "record_relink_answer": lambda request_id, value: record_relink_answer(
+                    request_id, value, self.db_path
+                ),
+                "cancel_relink": lambda user_id: cancel_relink(
+                    user_id, self.db_path
+                ),
+                "decide_relink": lambda request_id, partner_id, approved, owner_id: decide_relink(
+                    request_id, partner_id, approved, owner_id, self.db_path
+                ),
                 "get_application": lambda app_id: get_application(
                     app_id, self.db_path
                 ),
@@ -160,7 +195,7 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._count("cases"), 0)
         welcome = update.message.reply_text.await_args.args[0]
         self.assertIn("Лера, здравствуйте", welcome)
-        self.assertIn("распознаёт Вас как партнёра", welcome)
+        self.assertIn("рабочий Telegram подключён", welcome)
 
     async def test_repeated_partner_start_is_idempotent_and_preserves_terms(self):
         update = self._update(731245678, "lerikaDi", "Лера")
@@ -226,7 +261,7 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
     async def test_partner_choice_is_deduplicated_and_grants_no_access(self):
         context = self._context()
         first = self._callback_update(822345678, "applicant", "role:partner")
-        second = self._callback_update(822345678, "applicant", "role:partner")
+        second = self._callback_update(822345678, "applicant", "role:partner_new")
         with self._bot_patches():
             await bot.role_choice_callback_handler(first, context)
             await bot.role_choice_callback_handler(second, context)
@@ -236,10 +271,47 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._count("partners", "telegram_user_id=?", (822345678,)), 0)
         self.assertEqual(self._count("clients", "telegram_id=?", (822345678,)), 0)
 
+    async def test_partner_second_choice_appears_only_after_partner_choice(self):
+        initial = self._update(822345678, "applicant")
+        await self._start(initial)
+        initial_markup = initial.message.reply_text.await_args.kwargs["reply_markup"]
+        initial_labels = [b.text for row in initial_markup.inline_keyboard for b in row]
+        self.assertNotIn("🆕 Я новый партнёр", initial_labels)
+        self.assertNotIn("🔄 Я уже сотрудничаю, но сменил аккаунт", initial_labels)
+
+        choice = self._callback_update(822345678, "applicant", "role:partner")
+        with self._bot_patches():
+            await bot.role_choice_callback_handler(choice, self._context())
+        markup = choice.callback_query.edit_message_text.await_args.kwargs["reply_markup"]
+        labels = [b.text for row in markup.inline_keyboard for b in row]
+        self.assertEqual(labels, [
+            "🆕 Я новый партнёр",
+            "🔄 Я уже сотрудничаю, но сменил аккаунт",
+        ])
+        self.assertEqual(self._count("partner_applications"), 0)
+        self.assertEqual(self._count("partner_identity_relink_requests"), 0)
+
+    def test_onboarding_callback_data_stays_within_telegram_limit(self):
+        maximum = 9223372036854775807
+        markup = bot._admin_keyboard([[
+            ("confirm", f"relink:confirm:{maximum}:{maximum}"),
+            ("application", f"application:approve:{maximum}"),
+        ]])
+        callbacks = [
+            button.callback_data
+            for row in markup.inline_keyboard for button in row
+        ]
+        callbacks.extend([
+            button.callback_data
+            for keyboard in (bot._role_choice_keyboard(), bot._partner_path_keyboard())
+            for row in keyboard.inline_keyboard for button in row
+        ])
+        self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callbacks))
+
     async def test_application_completion_notifies_only_owner(self):
         application, _ = start_application(822345678, "applicant", self.db_path)
         context = self._context()
-        answers = ("Компания", "Трансферы", "Пхукет", "@applicant")
+        answers = self.APPLICATION_ANSWERS
         with self._bot_patches():
             for answer in answers:
                 update = self._update(822345678, "applicant")
@@ -256,6 +328,25 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
             context.bot.send_message.await_args.kwargs["chat_id"], self.admin_id
         )
 
+    async def test_last_optional_question_can_be_skipped(self):
+        application, _ = start_application(822345678, "applicant", self.db_path)
+        for answer in self.APPLICATION_ANSWERS[:-1]:
+            application = record_application_answer(
+                application["id"], answer, self.db_path
+            )
+        self.assertEqual(application["current_step"], "licenses")
+        update = self._callback_update(822345678, "applicant", "role:app_skip")
+        context = self._context()
+        with self._bot_patches():
+            await bot.role_choice_callback_handler(update, context)
+        completed = get_application(application["id"], self.db_path)
+        self.assertEqual(completed["status"], "needs_review")
+        context.bot.send_message.assert_awaited_once()
+        self.assertIn(
+            "передана владельцу",
+            update.callback_query.edit_message_text.await_args.args[0],
+        )
+
     async def test_application_can_be_cancelled_and_restarted(self):
         first, _ = start_application(822345678, "applicant", self.db_path)
         cancel_application(822345678, self.db_path)
@@ -267,7 +358,7 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_owner_approve_creates_and_links_active_partner(self):
         application, _ = start_application(822345678, "applicant", self.db_path)
-        for answer in ("Компания", "Трансферы", "Пхукет", "@applicant"):
+        for answer in self.APPLICATION_ANSWERS:
             application = record_application_answer(
                 application["id"], answer, self.db_path
             )
@@ -282,7 +373,7 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_owner_reject_grants_no_partner_access(self):
         application, _ = start_application(822345678, "applicant", self.db_path)
-        for answer in ("Компания", "Трансферы", "Пхукет", "@applicant"):
+        for answer in self.APPLICATION_ANSWERS:
             application = record_application_answer(
                 application["id"], answer, self.db_path
             )
@@ -295,7 +386,7 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_owner_can_approve_from_admin_callback(self):
         application, _ = start_application(822345678, "applicant", self.db_path)
-        for answer in ("Компания", "Трансферы", "Пхукет", "@applicant"):
+        for answer in self.APPLICATION_ANSWERS:
             application = record_application_answer(
                 application["id"], answer, self.db_path
             )
@@ -311,6 +402,31 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "Заявка утверждена",
             update.callback_query.edit_message_text.await_args.args[0],
+        )
+        partner = get_partner(decided["partner_id"], self.db_path)
+        self.assertEqual(partner["approved_terms"], {})
+        welcome = context.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Как мы работаем", welcome)
+        self.assertIn("запрос клиента", welcome)
+
+    async def test_owner_relink_approval_sends_full_welcome(self):
+        sync_partner_telegram_identity(731245678, "lerikaDi", self.db_path)
+        request, _ = start_relink(8502972477, "Hereld", self.db_path)
+        request = record_relink_answer(request["id"], "Лера", self.db_path)
+        request = record_relink_answer(request["id"], "@lerikaDi", self.db_path)
+        update = self._callback_update(
+            self.admin_id, "owner",
+            f"relink:confirm:{request['id']}:{self.lera['id']}",
+        )
+        context = self._context()
+        with self._bot_patches():
+            await bot.admin_callback_handler(update, context)
+        welcome = context.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Как мы работаем", welcome)
+        self.assertIn("Коммерческие условия не меняются автоматически", welcome)
+        self.assertEqual(
+            get_partner(self.lera["id"], self.db_path)["telegram_user_id"],
+            8502972477,
         )
 
     async def test_existing_client_case_is_not_reset(self):

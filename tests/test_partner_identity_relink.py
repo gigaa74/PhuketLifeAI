@@ -1,0 +1,299 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from database import MIGRATIONS, get_connection, init_db
+from partner_identity_relinks import (
+    PartnerIdentityRelinkError,
+    decide_relink,
+    get_relink,
+    record_relink_answer,
+    start_relink,
+)
+from partner_network import (
+    create_partner,
+    get_partner,
+    resolve_partner_telegram_identity,
+    sync_partner_telegram_identity,
+)
+from scripts.onboard_lera_partner import onboard_lera
+from scripts.repair_lera_identity_merge import (
+    LeraRepairConflict,
+    repair_lera_identity,
+)
+
+
+class PartnerIdentityRelinkTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp.name) / "relink.db"
+        init_db(self.db_path)
+        self.lera, _ = onboard_lera(self.db_path)
+        sync_partner_telegram_identity(1905717582, "lerikaDi", self.db_path)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _completed(self, user_id=8502972477, username="Hereld"):
+        request, created = start_relink(user_id, username, self.db_path)
+        self.assertTrue(created)
+        request = record_relink_answer(request["id"], "Лера", self.db_path)
+        return record_relink_answer(request["id"], "@lerikaDi", self.db_path)
+
+    def test_relink_approve_preserves_partner_terms_and_revokes_old_identity(self):
+        before = get_partner(self.lera["id"], self.db_path)
+        request = self._completed()
+        decided = decide_relink(
+            request["id"], self.lera["id"], True, 900001, self.db_path
+        )
+        after = get_partner(self.lera["id"], self.db_path)
+        self.assertEqual(decided["status"], "approved")
+        self.assertEqual(after["telegram_user_id"], 8502972477)
+        self.assertEqual(after["telegram_username"], "Hereld")
+        self.assertEqual(after["approved_terms"], before["approved_terms"])
+        self.assertEqual(after["services"], before["services"])
+        self.assertEqual(after["operational_notes"], before["operational_notes"])
+        self.assertEqual(
+            resolve_partner_telegram_identity(1905717582, "lerikaDi", self.db_path)["status"],
+            "not_found",
+        )
+        self.assertEqual(
+            resolve_partner_telegram_identity(8502972477, "Hereld", self.db_path)["partner"]["id"],
+            self.lera["id"],
+        )
+        connection = get_connection(self.db_path)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM partners").fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_relink_reject_and_identity_conflict_grant_no_access(self):
+        request = self._completed()
+        rejected = decide_relink(request["id"], 0, False, 900001, self.db_path)
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(get_partner(self.lera["id"], self.db_path)["telegram_user_id"], 1905717582)
+
+        request, _ = start_relink(777001, "occupied", self.db_path)
+        request = record_relink_answer(request["id"], "Лера", self.db_path)
+        request = record_relink_answer(request["id"], "@lerikaDi", self.db_path)
+        create_partner(
+            "Other", ["housing"], status="active", telegram_username="occupied",
+            db_path=self.db_path,
+        )
+        with self.assertRaises(PartnerIdentityRelinkError):
+            decide_relink(request["id"], self.lera["id"], True, 900001, self.db_path)
+
+    def test_one_numeric_identity_has_one_open_relink(self):
+        first, created = start_relink(8502972477, "Hereld", self.db_path)
+        second, created_again = start_relink(8502972477, "changed", self.db_path)
+        self.assertTrue(created)
+        self.assertFalse(created_again)
+        self.assertEqual(first["id"], second["id"])
+
+
+class TwoStageMigrationTests(unittest.TestCase):
+    def test_migration_011_preserves_v10_data_and_adds_structures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "v10.db"
+            connection = get_connection(db_path)
+            try:
+                connection.execute(
+                    """CREATE TABLE schema_migrations(
+                       version INTEGER PRIMARY KEY, applied_at TIMESTAMP)"""
+                )
+                for version, migration in MIGRATIONS:
+                    if version > 10:
+                        break
+                    with connection:
+                        migration(connection)
+                        connection.execute(
+                            "INSERT INTO schema_migrations(version) VALUES(?)",
+                            (version,),
+                        )
+                with connection:
+                    connection.execute(
+                        "INSERT INTO partners(name,status) VALUES('Existing','active')"
+                    )
+                    connection.execute(
+                        """INSERT INTO partner_applications
+                           (telegram_user_id,status,current_step,applicant_name)
+                           VALUES(123,'collecting','contact','Existing applicant')"""
+                    )
+                before = connection.execute(
+                    "SELECT * FROM partners"
+                ).fetchall()
+            finally:
+                connection.close()
+            init_db(db_path)
+            connection = get_connection(db_path)
+            try:
+                columns = {
+                    row[1] for row in connection.execute(
+                        "PRAGMA table_info(partner_applications)"
+                    )
+                }
+                self.assertTrue({
+                    "delivery_model_text", "live_source_text",
+                    "availability_confirmation_text",
+                    "request_requirements_text", "commercial_model_text",
+                    "links_text", "licenses_text",
+                }.issubset(columns))
+                self.assertIsNotNone(connection.execute(
+                    """SELECT name FROM sqlite_master WHERE type='table'
+                       AND name='partner_identity_relink_requests'"""
+                ).fetchone())
+                self.assertEqual(
+                    connection.execute("SELECT * FROM partners").fetchall(), before
+                )
+                self.assertEqual(
+                    [row[0] for row in connection.execute(
+                        "SELECT version FROM schema_migrations ORDER BY version"
+                    )], list(range(1, 12)),
+                )
+            finally:
+                connection.close()
+
+
+class LeraIdentityRepairTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp.name) / "repair.db"
+        init_db(self.db_path)
+        connection = get_connection(self.db_path)
+        try:
+            with connection:
+                for partner_id, name in ((1, "One"), (2, "Two"), (4, "Four"), (5, "Five")):
+                    connection.execute(
+                        "INSERT INTO partners(id,name,status) VALUES(?,?,'active')",
+                        (partner_id, name),
+                    )
+                connection.execute(
+                    """INSERT INTO partners
+                       (id,name,status,partner_type,telegram_user_id,telegram_username,
+                        services,areas,operational_notes)
+                       VALUES(3,'Лера','active','hybrid',1905717582,'lerikaDi',
+                              '["housing"]','["Karon"]','notes')"""
+                )
+                connection.execute(
+                    """INSERT INTO partners
+                       (id,name,status,telegram_user_id,telegram_username,contacts)
+                       VALUES(6,'Валерия','active',8502972477,NULL,'@Hereld')"""
+                )
+                for index in range(7):
+                    connection.execute(
+                        """INSERT INTO partner_approved_terms
+                           (partner_id,term_key,term_value) VALUES(3,?,?,?)""".replace(
+                            "VALUES(3,?,?,?)", "VALUES(3,?,?)"
+                        ), (f"term_{index}", str(index)),
+                    )
+                for _ in range(2):
+                    connection.execute(
+                        """INSERT INTO partner_commercial_audit
+                           (partner_id,action,actor_type) VALUES(3,'existing','owner')"""
+                    )
+                connection.execute(
+                    """INSERT INTO partner_applications
+                       (id,telegram_user_id,telegram_username,contact_text,status,
+                        current_step,partner_id)
+                       VALUES(1,8502972477,'Hereld','@Hereld','approved','complete',6)"""
+                )
+        finally:
+            connection.close()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_repair_dry_run_apply_and_idempotency(self):
+        dry = repair_lera_identity(self.db_path, dry_run=True)
+        self.assertTrue(dry["changed"])
+        self.assertIsNotNone(get_partner(6, self.db_path))
+        applied = repair_lera_identity(self.db_path, dry_run=False)
+        repeated = repair_lera_identity(self.db_path, dry_run=False)
+        self.assertTrue(applied["changed"])
+        self.assertFalse(repeated["changed"])
+        lera = get_partner(3, self.db_path)
+        self.assertEqual(lera["telegram_user_id"], 8502972477)
+        self.assertEqual(lera["telegram_username"], "Hereld")
+        self.assertIsNone(get_partner(6, self.db_path))
+        self.assertEqual(len(lera["approved_terms"]), 7)
+        connection = get_connection(self.db_path)
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT partner_id FROM partner_applications WHERE id=1"
+            ).fetchone()[0], 3)
+        finally:
+            connection.close()
+
+    def test_repair_refuses_unexpected_state(self):
+        connection = get_connection(self.db_path)
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE partners SET telegram_username='unexpected' WHERE id=3"
+                )
+        finally:
+            connection.close()
+        with self.assertRaises(LeraRepairConflict):
+            repair_lera_identity(self.db_path, dry_run=False)
+
+    def test_repair_refuses_unknown_partner_dependency_without_deleting(self):
+        connection = get_connection(self.db_path)
+        try:
+            with connection:
+                connection.execute(
+                    """CREATE TABLE unexpected_partner_link(
+                       id INTEGER PRIMARY KEY, partner_id INTEGER,
+                       FOREIGN KEY(partner_id) REFERENCES partners(id))"""
+                )
+                connection.execute(
+                    "INSERT INTO unexpected_partner_link(partner_id) VALUES(6)"
+                )
+        finally:
+            connection.close()
+        with self.assertRaises(LeraRepairConflict):
+            repair_lera_identity(self.db_path, dry_run=False)
+        self.assertIsNotNone(get_partner(6, self.db_path))
+        self.assertEqual(get_partner(3, self.db_path)["telegram_user_id"], 1905717582)
+
+    def test_repair_rolls_back_everything_on_dependency_collision(self):
+        connection = get_connection(self.db_path)
+        try:
+            with connection:
+                connection.execute(
+                    "INSERT INTO clients(telegram_id) VALUES(700001)"
+                )
+                client_id = connection.execute(
+                    "SELECT id FROM clients WHERE telegram_id=700001"
+                ).fetchone()[0]
+                connection.execute(
+                    "INSERT INTO cases(client_id,status) VALUES(?,'new')",
+                    (client_id,),
+                )
+                case_id = connection.execute(
+                    "SELECT id FROM cases WHERE client_id=?", (client_id,)
+                ).fetchone()[0]
+                for partner_id in (3, 6):
+                    connection.execute(
+                        """INSERT INTO partner_requests
+                           (case_id,partner_id,service_category,status,request_payload)
+                           VALUES(?,?,'housing','created','{}')""",
+                        (case_id, partner_id),
+                    )
+        finally:
+            connection.close()
+        with self.assertRaises(LeraRepairConflict):
+            repair_lera_identity(self.db_path, dry_run=False)
+        canonical = get_partner(3, self.db_path)
+        duplicate = get_partner(6, self.db_path)
+        self.assertEqual(canonical["telegram_user_id"], 1905717582)
+        self.assertEqual(canonical["telegram_username"], "lerikaDi")
+        self.assertEqual(duplicate["telegram_user_id"], 8502972477)
+        self.assertIsNone(duplicate["telegram_username"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -148,7 +148,7 @@ class ScoutDetectedCategoriesMigrationTests(unittest.TestCase):
                 connection.close()
             self.assertIn("telegram_user_id", columns)
             self.assertEqual(json.loads(raw), ["housing"])
-            self.assertEqual(versions, list(range(1, 11)))
+            self.assertEqual(versions, list(range(1, 12)))
 
 
 if __name__ == "__main__":

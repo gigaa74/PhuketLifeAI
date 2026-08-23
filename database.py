@@ -387,6 +387,52 @@ def _migration_010_partner_referral_requests(connection):
     )
 
 
+def _migration_011_two_stage_partner_onboarding(connection):
+    columns = _column_names(connection, "partner_applications")
+    additions = (
+        ("delivery_model_text", "TEXT"),
+        ("live_source_text", "TEXT"),
+        ("availability_confirmation_text", "TEXT"),
+        ("request_requirements_text", "TEXT"),
+        ("commercial_model_text", "TEXT"),
+        ("links_text", "TEXT"),
+        ("licenses_text", "TEXT"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE partner_applications ADD COLUMN {name} {definition}"
+            )
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS partner_identity_relink_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_user_id INTEGER NOT NULL,
+            telegram_username TEXT,
+            partner_name_text TEXT,
+            previous_contact_text TEXT,
+            status TEXT NOT NULL DEFAULT 'collecting'
+                CHECK(status IN ('collecting', 'needs_review', 'approved',
+                                 'rejected', 'cancelled')),
+            current_step TEXT NOT NULL DEFAULT 'partner_name',
+            selected_partner_id INTEGER,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            submitted_at TIMESTAMP,
+            decided_at TIMESTAMP,
+            decided_by INTEGER,
+            decision_note TEXT,
+            FOREIGN KEY (selected_partner_id) REFERENCES partners(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_relinks_open_identity
+            ON partner_identity_relink_requests(telegram_user_id)
+            WHERE status IN ('collecting', 'needs_review');
+        CREATE INDEX IF NOT EXISTS idx_partner_relinks_review
+            ON partner_identity_relink_requests(status, id);
+        """
+    )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
@@ -398,6 +444,7 @@ MIGRATIONS = (
     (8, _migration_008_scout_detected_categories),
     (9, _migration_009_partner_applications),
     (10, _migration_010_partner_referral_requests),
+    (11, _migration_011_two_stage_partner_onboarding),
 )
 
 
