@@ -102,6 +102,14 @@ from partner_applications import (
     record_application_answer,
     start_application,
 )
+from partner_referrals import (
+    PartnerReferralError,
+    create_partner_referral,
+    get_partner_referral,
+    mark_owner_notification,
+    set_partner_referral_status,
+    status_label_ru as referral_status_label_ru,
+)
 
 from case_engine import (
     update_case,
@@ -1538,6 +1546,81 @@ def _format_decision_terms(changes):
     )
 
 
+def _partner_referral_buttons(request_id):
+    return _admin_keyboard([
+        [("▶️ Взять в работу", f"referral:status:{request_id}:in_progress")],
+        [("❓ Нужны детали", f"referral:status:{request_id}:needs_partner_info")],
+        [("✅ Решено", f"referral:status:{request_id}:resolved")],
+        [("Закрыть", f"referral:status:{request_id}:closed")],
+    ])
+
+
+def _format_partner_referral_owner(request, partner):
+    username = request.get("telegram_username_snapshot")
+    original = request.get("original_text") or "Текст отсутствует"
+    return (
+        f"🧾 Новый запрос партнёра №{request['id']}\n\n"
+        f"Партнёр: {partner['name']}\n"
+        f"Telegram username: {'@' + username if username else 'не указан'}\n"
+        f"Сообщение: {original}\n"
+        f"Тип вложения: {request['message_type']}\n"
+        f"Дата: {request['created_at']}\n"
+        f"Статус: {referral_status_label_ru(request['status'])}"
+    )
+
+
+def _partner_referral_payload(message):
+    text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    metadata = {}
+    file_id = None
+    if getattr(message, "text", None):
+        message_type = "text"
+    elif getattr(message, "photo", None):
+        message_type = "photo"
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        metadata = {
+            "width": getattr(photo, "width", None),
+            "height": getattr(photo, "height", None),
+            "file_size": getattr(photo, "file_size", None),
+        }
+    elif getattr(message, "document", None):
+        message_type = "document"
+        document = message.document
+        file_id = document.file_id
+        metadata = {
+            "file_name": getattr(document, "file_name", None),
+            "mime_type": getattr(document, "mime_type", None),
+            "file_size": getattr(document, "file_size", None),
+        }
+    elif getattr(message, "voice", None):
+        message_type = "voice"
+        voice = message.voice
+        file_id = voice.file_id
+        metadata = {
+            "duration": getattr(voice, "duration", None),
+            "mime_type": getattr(voice, "mime_type", None),
+            "file_size": getattr(voice, "file_size", None),
+        }
+    elif getattr(message, "location", None):
+        message_type = "location"
+        metadata = {
+            "latitude": message.location.latitude,
+            "longitude": message.location.longitude,
+        }
+    elif getattr(message, "contact", None):
+        message_type = "contact"
+        metadata = {
+            "phone_number": message.contact.phone_number,
+            "first_name": message.contact.first_name,
+            "last_name": getattr(message.contact, "last_name", None),
+            "telegram_user_id": getattr(message.contact, "user_id", None),
+        }
+    else:
+        message_type = "other"
+    return text, message_type, file_id, metadata
+
+
 async def _show_pending_terms(query, partner_id):
     partner = get_partner(partner_id)
     if not partner:
@@ -1769,6 +1852,13 @@ async def admin_callback_handler(update, context):
                 "Утверждённые условия не изменены.\n\n" + delivery_status,
                 reply_markup=_admin_keyboard([[("🤝 Посмотреть партнёра", f"partner:view:{partner['id']}")]]),
             )
+        elif parts[:2] == ["referral", "status"]:
+            referral = set_partner_referral_status(int(parts[2]), parts[3])
+            partner = get_partner(referral["partner_id"])
+            await query.edit_message_text(
+                _format_partner_referral_owner(referral, partner),
+                reply_markup=_partner_referral_buttons(referral["id"]),
+            )
         elif parts[:2] == ["application", "view"]:
             application = get_application(int(parts[2]))
             if not application:
@@ -1819,7 +1909,7 @@ async def admin_callback_handler(update, context):
     except (OfferTelegramError, PartnerTelegramError):
         await query.edit_message_text("Telegram не подтвердил отправку. Попробуйте ещё раз.")
     except (OfferHandoffError, PartnerNetworkError,
-            PartnerApplicationError) as error:
+            PartnerApplicationError, PartnerReferralError) as error:
         await query.edit_message_text(f"Не удалось выполнить действие: {error}")
 
 
@@ -1921,8 +2011,13 @@ async def partner_reply_handler(update, context):
 
 
 async def partner_identity_sync_handler(update, context):
+    if getattr(update, "callback_query", None):
+        return
     user = update.effective_user
     if not user:
+        return
+    if (SETTINGS.telegram_admin_user_id is not None
+            and user.id == SETTINGS.telegram_admin_user_id):
         return
     message = update.effective_message
     if not message:
@@ -1957,11 +2052,57 @@ async def partner_identity_sync_handler(update, context):
                 print("[PARTNER] Admin notification failed: " + type(error).__name__)
         raise ApplicationHandlerStop
 
-    if message.reply_to_message:
+    if getattr(message, "reply_to_message", None):
         return
-    await message.reply_text(
-        "Спасибо, сообщение получили и передали в партнёрский контур Phuket Life."
+    original_text, message_type, file_id, metadata = _partner_referral_payload(
+        message
     )
+    effective_chat = getattr(update, "effective_chat", None)
+    source_chat_id = (
+        effective_chat.id if effective_chat else message.chat_id
+    )
+    referral, created = create_partner_referral(
+        partner["id"], source_chat_id, message.message_id, user.id,
+        user.username, original_text, message_type,
+        telegram_file_id=file_id, attachment_metadata=metadata,
+    )
+    if not created:
+        raise ApplicationHandlerStop
+    acknowledgement = (
+        f"Запрос №{referral['id']} принят и передан владельцу Phuket Life "
+        "для проверки. Мы вернёмся к Вам после того, как найдём безопасное "
+        "решение или потребуются дополнительные данные."
+    )
+    if message_type != "text":
+        acknowledgement += " Файл или данные вложения получены."
+    await message.reply_text(acknowledgement)
+    admin_id = SETTINGS.telegram_admin_user_id
+    if admin_id is None:
+        mark_owner_notification(
+            referral["id"], False, error="admin_user_id_missing"
+        )
+        raise ApplicationHandlerStop
+    try:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=_format_partner_referral_owner(referral, partner),
+            reply_markup=_partner_referral_buttons(referral["id"]),
+        )
+        if message_type != "text":
+            await context.bot.copy_message(
+                chat_id=admin_id,
+                from_chat_id=source_chat_id,
+                message_id=message.message_id,
+            )
+        mark_owner_notification(referral["id"], True)
+    except Exception as error:
+        mark_owner_notification(
+            referral["id"], False, error=type(error).__name__
+        )
+        print(
+            "[PARTNER_REFERRAL] Owner notification failed: "
+            + type(error).__name__
+        )
     raise ApplicationHandlerStop
 
 
@@ -2491,7 +2632,7 @@ def main():
     app.add_handler(
         CallbackQueryHandler(
             admin_callback_handler,
-            pattern=r"^(admin|case|offer|partner|terms|application):",
+            pattern=r"^(admin|case|offer|partner|terms|application|referral):",
         )
     )
 

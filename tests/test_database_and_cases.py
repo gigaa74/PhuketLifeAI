@@ -42,7 +42,7 @@ class DatabaseAndCaseTests(unittest.TestCase):
         self.assertTrue(
             {"category", "data", "missing_data", "priority"}.issubset(columns)
         )
-        self.assertEqual(versions, list(range(1, 10)))
+        self.assertEqual(versions, list(range(1, 11)))
 
     def test_client_case_creation_update_and_ready_transition(self):
         client_id = get_or_create_client(

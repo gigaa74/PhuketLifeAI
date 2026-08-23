@@ -355,6 +355,38 @@ def _migration_009_partner_applications(connection):
     )
 
 
+def _migration_010_partner_referral_requests(connection):
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS partner_referral_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL,
+            source_chat_id INTEGER NOT NULL,
+            source_message_id INTEGER NOT NULL,
+            partner_telegram_user_id INTEGER NOT NULL,
+            telegram_username_snapshot TEXT,
+            original_text TEXT NOT NULL DEFAULT '',
+            message_type TEXT NOT NULL,
+            telegram_file_id TEXT,
+            attachment_metadata TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'needs_owner_review'
+                CHECK(status IN ('needs_owner_review', 'in_progress',
+                                 'needs_partner_info', 'resolved', 'closed')),
+            owner_notified_at TIMESTAMP,
+            owner_notification_error TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(source_chat_id, source_message_id),
+            FOREIGN KEY (partner_id) REFERENCES partners(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_partner_referrals_status
+            ON partner_referral_requests(status, id);
+        CREATE INDEX IF NOT EXISTS idx_partner_referrals_partner
+            ON partner_referral_requests(partner_id, id);
+        """
+    )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
@@ -365,6 +397,7 @@ MIGRATIONS = (
     (7, _migration_007_scout_candidates),
     (8, _migration_008_scout_detected_categories),
     (9, _migration_009_partner_applications),
+    (10, _migration_010_partner_referral_requests),
 )
 
 
