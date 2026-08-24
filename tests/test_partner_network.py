@@ -262,7 +262,7 @@ class PartnerMigrationTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(case_title, "Legacy case")
             self.assertEqual(partner_name, "Legacy partner")
-            self.assertEqual(versions, list(range(1, 12)))
+            self.assertEqual(versions, list(range(1, 13)))
             self.assertIsNotNone(request_table)
 
 

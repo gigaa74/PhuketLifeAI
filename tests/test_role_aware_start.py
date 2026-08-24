@@ -156,6 +156,9 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
                 "get_application": lambda app_id: get_application(
                     app_id, self.db_path
                 ),
+                "get_partner": lambda partner_id: get_partner(
+                    partner_id, self.db_path
+                ),
                 "list_applications": lambda: list_applications(
                     "needs_review", self.db_path
                 ),

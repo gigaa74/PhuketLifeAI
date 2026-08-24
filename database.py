@@ -433,6 +433,40 @@ def _migration_011_two_stage_partner_onboarding(connection):
     )
 
 
+def _migration_012_manual_leads(connection):
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS manual_leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_telegram_id INTEGER NOT NULL,
+            source_chat_id INTEGER,
+            source_message_id INTEGER,
+            source_metadata TEXT NOT NULL DEFAULT '{}',
+            original_text TEXT NOT NULL,
+            normalized_content_hash TEXT NOT NULL,
+            classification TEXT NOT NULL DEFAULT 'unclear'
+                CHECK(classification IN ('client', 'partner', 'unclear')),
+            categories TEXT NOT NULL DEFAULT '[]',
+            extracted_data TEXT NOT NULL DEFAULT '{}',
+            generated_draft TEXT,
+            status TEXT NOT NULL DEFAULT 'needs_review'
+                CHECK(status IN ('needs_review', 'ready', 'in_progress', 'rejected')),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_manual_leads_source
+            ON manual_leads(source_chat_id, source_message_id)
+            WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL;
+        DROP INDEX IF EXISTS idx_manual_leads_owner_hash;
+        CREATE UNIQUE INDEX idx_manual_leads_owner_hash
+            ON manual_leads(owner_telegram_id, normalized_content_hash)
+            WHERE source_chat_id IS NULL AND source_message_id IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_manual_leads_status
+            ON manual_leads(status, id);
+        """
+    )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
@@ -445,6 +479,7 @@ MIGRATIONS = (
     (9, _migration_009_partner_applications),
     (10, _migration_010_partner_referral_requests),
     (11, _migration_011_two_stage_partner_onboarding),
+    (12, _migration_012_manual_leads),
 )
 
 
