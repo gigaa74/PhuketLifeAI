@@ -105,6 +105,37 @@ class ManualLeadCoreTests(unittest.TestCase):
             self.assertNotIn("комисси", draft.casefold())
             self.assertNotIn("уже подключ", draft.casefold())
 
+    def test_client_builds_separate_safe_partner_request(self):
+        result = build_analysis(
+            "Ищу виллу в Кароне на месяц для 4 человек, бюджет 120000 бат. "
+            "Писать @private_client"
+        )
+        request = result["partner_request_draft"]
+        self.assertIn("клиентский запрос от Phuket Life", request)
+        self.assertIn("— район: Карон", request)
+        self.assertIn("— количество гостей: 4", request)
+        self.assertIn("— бюджет: 120 000 бат", request)
+        self.assertIn("Контакт клиента передадим только после согласования", request)
+        self.assertNotIn("@private_client", request)
+        self.assertIsNone(build_analysis("Предлагаю экскурсии")["partner_request_draft"])
+
+    def test_family_housing_range_is_extracted_without_losing_facts(self):
+        result = build_analysis(
+            "Ищем дом в Rawai или Chalong: 2 взрослых и ребёнок 9 лет, "
+            "2–3 спальни, бассейн, срок 10–12 месяцев, бюджет 40000–70000 бат, "
+            "без домашних животных."
+        )
+        known = result["extracted"]
+        self.assertEqual(known["people"], 3)
+        self.assertEqual(known["budget"], "40000–70000 бат")
+        self.assertEqual(known["dates_or_duration"], "срок 10–12 месяцев")
+        self.assertIn("2–3 спальни", known["requirements"])
+        self.assertIn("бассейн", known["requirements"])
+        request = result["partner_request_draft"]
+        self.assertIn("— бюджет: 40 000–70 000 бат", request)
+        self.assertIn("— количество гостей: 3", request)
+        self.assertNotIn("даты или срок", result["missing"])
+
     def test_client_voice_uses_we_concrete_next_step_and_no_banned_phrases(self):
         result = build_analysis(
             "Ищу виллу в Кароне на месяц для 4 человек, бюджет 120000 бат"
@@ -161,7 +192,8 @@ class ManualLeadCoreTests(unittest.TestCase):
             "generated_draft": analysis["draft"], "source_metadata": {},
             "extracted_data": {"known": analysis["extracted"],
                                "missing": analysis["missing"],
-                               "signal": analysis["signal"], "reasons": []},
+                               "signal": analysis["signal"], "reasons": [],
+                               "partner_request_draft": analysis["partner_request_draft"]},
         }
         card = bot._format_manual_lead(lead)
         self.assertIn("— район: Карон", card)
@@ -171,6 +203,9 @@ class ManualLeadCoreTests(unittest.TestCase):
         self.assertNotIn("people:", card)
         self.assertNotIn("message_source:", card)
         self.assertNotIn("['Карон']", card)
+        self.assertIn("ТЕКСТ КЛИЕНТУ", card)
+        self.assertIn("ЗАЯВКА ПАРТНЁРУ", card)
+        self.assertIn("Автоотправка выключена", card)
 
     def test_prompt_injection_is_delimited_and_llm_failure_uses_fallback(self):
         captured = []
@@ -237,6 +272,20 @@ class ManualLeadCoreTests(unittest.TestCase):
         self.assertTrue(copied_created)
         self.assertFalse(copied_duplicate)
         self.assertEqual(copied["id"], copied_again["id"])
+
+    def test_partner_request_is_persisted_and_regenerated(self):
+        analysis = build_analysis("Нужен трансфер завтра для 3 человек")
+        lead, _ = create_manual_lead(10, "Нужен трансфер завтра для 3 человек", analysis,
+                                     db_path=self.db_path)
+        self.assertIn(
+            "клиентский запрос от Phuket Life",
+            lead["extracted_data"]["partner_request_draft"],
+        )
+        changed = build_analysis(
+            "Нужен трансфер завтра для 3 человек", forced_classification="partner"
+        )
+        lead = update_manual_lead(lead["id"], analysis=changed, db_path=self.db_path)
+        self.assertIsNone(lead["extracted_data"]["partner_request_draft"])
 
     def test_migration_012_preserves_existing_data(self):
         connection = get_connection(self.db_path)
@@ -343,7 +392,8 @@ class ManualLeadBotTests(unittest.IsolatedAsyncioTestCase):
         )
         await self._handle(forwarded)
         self.assertEqual(self._count("manual_leads"), 2)
-        self.assertIn("Готовый текст", copied.reply_text.await_args.args[0])
+        self.assertIn("ТЕКСТ КЛИЕНТУ", copied.reply_text.await_args.args[0])
+        self.assertIn("ЗАЯВКА ПАРТНЁРУ", copied.reply_text.await_args.args[0])
         lead = get_manual_lead(2, self.db_path)
         self.assertEqual(lead["source_metadata"]["hidden_sender_name"], "Скрытый автор")
         self.assertEqual(lead["classification"], "partner")

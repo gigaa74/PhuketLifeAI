@@ -102,28 +102,53 @@ def extract_lead_details(text, *, username=None, source=None):
     if re.search(r"\b(?:по\s+всему\s+(?:острову|пхукету)|весь\s+пхукет)\b", value, re.I):
         details["work_geography"] = "весь Пхукет"
     date_match = re.search(
-        r"\b(?:с\s+\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?(?:\s+по\s+\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)?|"
+        r"\b(?:срок\s*:?\s*\d+\s*[-–—]\s*\d+\s*(?:дн\w*|недел\w*|месяц\w*)|"
+        r"с\s+\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?(?:\s+по\s+\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)?|"
         r"на\s+(?:(?:\d+|один|две|два)\s+)?(?:дн\w*|недел\w*|месяц\w*))\b",
         value, re.I,
     )
     if date_match:
         details["dates_or_duration"] = date_match.group(0)
-    budget = re.search(
-        r"\b(?:бюджет\s*)?(\d[\d\s.,]*)\s*(бат|thb|usd|доллар\w*|рубл\w*|₽|\$)\b",
+    budget_range = re.search(
+        r"\b(?:бюджет\s*:?\s*)?(\d[\d\s.,]*?)\s*[-–—]\s*(\d[\d\s.,]*?)\s*"
+        r"(бат|thb|usd|доллар\w*|рубл\w*|₽|\$)\b",
         value, re.I,
     )
-    if budget:
+    budget = re.search(
+        r"\b(?:бюджет\s*:?\s*)?(\d[\d\s.,]*)\s*(бат|thb|usd|доллар\w*|рубл\w*|₽|\$)\b",
+        value, re.I,
+    )
+    if budget_range:
+        details["budget"] = (
+            budget_range.group(1).strip() + "–" + budget_range.group(2).strip()
+            + " " + budget_range.group(3)
+        )
+    elif budget:
         details["budget"] = (budget.group(1).strip() + " " + budget.group(2)).strip()
-    people = re.search(r"\b(\d+)\s*(?:человек\w*|гост\w*|взросл\w*)\b", value, re.I)
-    if people:
+    family_total = re.search(r"\bсемь[яи]\s+из\s+(\d+)\s+человек", value, re.I)
+    adults = re.search(r"\b(\d+)\s*взросл\w*\b", value, re.I)
+    children = re.search(r"\b(\d+)\s*(?:дет\w*|реб[её]н\w*)\b", value, re.I)
+    one_child = bool(re.search(r"\b(?:и\s+)?реб[её]нок\b", value, re.I))
+    people = re.search(r"\b(\d+)\s*(?:человек\w*|гост\w*)\b", value, re.I)
+    if family_total:
+        details["people"] = int(family_total.group(1))
+    elif adults:
+        details["people"] = int(adults.group(1)) + (
+            int(children.group(1)) if children else (1 if one_child else 0)
+        )
+    elif people:
         details["people"] = int(people.group(1))
     urgency = re.search(r"\b(срочно|сегодня|завтра|как можно скорее)\b", value, re.I)
     if urgency:
         details["urgency"] = urgency.group(1)
     requirements = []
     for pattern in (
-        r"\bс питомц\w*\b", r"\bу моря\b", r"\bпервая линия\b",
-        r"\bс бассейн\w*\b", r"\bдетск\w+ кресл\w*\b",
+        r"\bс питомц\w*\b", r"\bбез (?:домашних )?(?:животн\w*|питомц\w*)\b",
+        r"\bу моря\b", r"\bпервая линия\b",
+        r"\b(?:(?:частн\w*|личн\w*|общ\w*)\s+)?бассейн\w*\b",
+        r"\b\d+\s*[-–—]?\s*\d*\s*спальн\w*\b",
+        r"\bкондиционер\w*[^.,;]{0,35}\b", r"\bпосудомоечн\w+ машин\w*\b",
+        r"\bстиральн\w+ машин\w*\b", r"\bдетск\w+ кресл\w*\b",
     ):
         found = re.search(pattern, value, re.I)
         if found:
@@ -224,6 +249,16 @@ def _people_words(value):
 
 
 def _format_budget(value):
+    range_match = re.match(r"\s*(\d[\d\s.,]*?)\s*[-–—]\s*(\d[\d\s.,]*?)\s*([^\d\s].*)$", str(value))
+    if range_match:
+        left = re.sub(r"\D", "", range_match.group(1))
+        right = re.sub(r"\D", "", range_match.group(2))
+        if left and right:
+            return (
+                f"{int(left):,}".replace(",", " ") + "–"
+                + f"{int(right):,}".replace(",", " ") + " "
+                + range_match.group(3).strip()
+            )
     match = re.match(r"(\d+)(.*)", str(value).replace(" ", ""))
     if not match:
         return str(value)
@@ -368,6 +403,50 @@ def deterministic_draft(classification, categories, details, missing):
     return None
 
 
+def deterministic_partner_request(categories, details, missing):
+    """Build an owner-reviewed request without exposing the lead's contact."""
+    if not categories:
+        return None
+    lines = [
+        "Здравствуйте! Есть клиентский запрос от Phuket Life.",
+        "",
+        "Запрос:",
+        "— услуга: " + _service_summary(categories),
+    ]
+    areas = details.get("areas") or []
+    if areas:
+        lines.append("— район: " + ", ".join(areas))
+    if details.get("dates_or_duration"):
+        lines.append("— даты / срок: " + _human_dates(details["dates_or_duration"]))
+    if details.get("people"):
+        lines.append("— количество гостей: " + str(details["people"]))
+    if details.get("budget"):
+        lines.append("— бюджет: " + _format_budget(details["budget"]))
+    requirements = details.get("requirements") or []
+    if requirements:
+        lines.append("— требования: " + "; ".join(requirements))
+    if missing:
+        lines.append("— ещё уточняем: " + "; ".join(missing))
+
+    if "housing" in categories:
+        response_request = (
+            "Если можете помочь, направьте, пожалуйста, актуальные варианты, "
+            "фотографии или видео, район, полную стоимость, депозит, доступную "
+            "дату и основные условия. Точный адрес на первом этапе не требуется."
+        )
+    else:
+        response_request = (
+            "Если можете помочь, направьте, пожалуйста, актуальные варианты, "
+            "полную стоимость, что входит в предложение, доступность и основные условия."
+        )
+    lines += [
+        "",
+        response_request,
+        "Контакт клиента передадим только после согласования следующего шага.",
+    ]
+    return "\n".join(lines)
+
+
 def generation_prompt(classification, categories, details, missing, original_text):
     facts = json.dumps(details, ensure_ascii=False, sort_keys=True)
     return (
@@ -442,6 +521,10 @@ def build_analysis(text, *, username=None, source=None, generator=None,
     draft = deterministic_draft(
         result["classification"], result["categories"], draft_details, missing
     )
+    partner_request_draft = (
+        deterministic_partner_request(result["categories"], details, missing)
+        if result["classification"] == "client" else None
+    )
     if draft and generator:
         try:
             generated = generator(generation_prompt(
@@ -453,7 +536,23 @@ def build_analysis(text, *, username=None, source=None, generator=None,
                 draft = generated.strip()
         except Exception as error:
             print("[MANUAL_LEAD] Draft fallback: " + type(error).__name__)
-    return {**result, "extracted": details, "missing": missing, "draft": draft}
+    return {
+        **result,
+        "extracted": details,
+        "missing": missing,
+        "draft": draft,
+        "partner_request_draft": partner_request_draft,
+    }
+
+
+def _analysis_payload(analysis):
+    return {
+        "known": analysis["extracted"],
+        "missing": analysis["missing"],
+        "signal": analysis["signal"],
+        "reasons": analysis["reasons"],
+        "partner_request_draft": analysis.get("partner_request_draft"),
+    }
 
 
 def _decode(row):
@@ -500,8 +599,7 @@ def create_manual_lead(owner_telegram_id, original_text, analysis, *,
                  json.dumps(source_metadata or {}, ensure_ascii=False), original_text,
                  normalized_hash, analysis["classification"],
                  json.dumps(analysis["categories"], ensure_ascii=False),
-                 json.dumps({"known": analysis["extracted"], "missing": analysis["missing"],
-                             "signal": analysis["signal"], "reasons": analysis["reasons"]}, ensure_ascii=False),
+                 json.dumps(_analysis_payload(analysis), ensure_ascii=False),
                  analysis.get("draft"),
                  "needs_review" if analysis["classification"] == "unclear" else "ready",
                  _now()),
@@ -558,8 +656,7 @@ def update_manual_lead(lead_id, *, classification=None, status=None,
         if analysis is not None:
             fields += ["categories=?", "extracted_data=?", "generated_draft=?"]
             values += [json.dumps(analysis["categories"], ensure_ascii=False),
-                       json.dumps({"known": analysis["extracted"], "missing": analysis["missing"],
-                                   "signal": analysis["signal"], "reasons": analysis["reasons"]}, ensure_ascii=False),
+                       json.dumps(_analysis_payload(analysis), ensure_ascii=False),
                        analysis.get("draft")]
         fields.append("updated_at=?"); values.append(_now()); values.append(int(lead_id))
         with connection:

@@ -1789,7 +1789,7 @@ def _manual_lead_buttons(lead_id):
             ("👤 Это клиент", f"lead:type:{lead_id}:client"),
             ("🤝 Это партнёр", f"lead:type:{lead_id}:partner"),
         ],
-        [("🔄 Другой вариант", f"lead:regen:{lead_id}")],
+        [("🔄 Обновить тексты", f"lead:regen:{lead_id}")],
         [("🚫 Не подходит", f"lead:reject:{lead_id}")],
     ])
 
@@ -1819,7 +1819,7 @@ def _format_manual_lead(lead):
             continue
         value = known[key]
         if key == "dates_or_duration" and any(char.isdigit() for char in str(value)):
-            label = "даты"
+            label = "срок" if "срок" in str(value).casefold() else "даты"
         if key == "budget":
             digits = str(value).split(maxsplit=1)
             if digits and digits[0].isdigit():
@@ -1843,9 +1843,9 @@ def _format_manual_lead(lead):
     text = (
         f"{heading}\n\nКатегория: {category_text}\n"
         f"Сигнал: {data.get('signal') or 'требуется ручная проверка'}\n"
-        f"Суть: {(lead.get('original_text') or '')[:700]}\n"
-        f"Что известно:\n{known_text[:700]}\n"
-        f"Что уточнить: {missing_text[:700]}\n"
+        f"Суть: {(lead.get('original_text') or '')[:400]}\n"
+        f"Что известно:\n{known_text[:500]}\n"
+        f"Что уточнить: {missing_text[:350]}\n"
         f"Источник: {source}\n"
         f"Контакт: {contact or 'не указан'}"
     )
@@ -1853,7 +1853,22 @@ def _format_manual_lead(lead):
         text += "\nПричины: " + "; ".join(reasons)
         text += "\n\nВыберите тип вручную, чтобы подготовить коммерческий текст."
     else:
-        text += "\n\n✉️ Готовый текст:\n\n" + (lead.get("generated_draft") or "Черновик недоступен")[:2500]
+        if lead["classification"] == "client":
+            text += (
+                "\n\n📨 ТЕКСТ КЛИЕНТУ:\n\n"
+                + (lead.get("generated_draft") or "Черновик недоступен")[:1100]
+            )
+            partner_request = data.get("partner_request_draft")
+            text += (
+                "\n\n🤝 ЗАЯВКА ПАРТНЁРУ:\n\n"
+                + (partner_request or "Сначала уточните критичные детали запроса.")[:1100]
+            )
+            text += "\n\n🔒 Автоотправка выключена: оба текста сначала проверяете Вы."
+        else:
+            text += (
+                "\n\n✉️ ПИСЬМО ПОТЕНЦИАЛЬНОМУ ПАРТНЁРУ:\n\n"
+                + (lead.get("generated_draft") or "Черновик недоступен")[:2000]
+            )
     return text[:4050]
 
 
