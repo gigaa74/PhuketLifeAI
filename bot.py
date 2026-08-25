@@ -112,9 +112,15 @@ from partner_referrals import (
 )
 from manual_leads import (
     ManualLeadError,
+    append_manual_lead_message,
     build_analysis as build_manual_lead_analysis,
+    build_followup_draft,
+    client_lead_dashboard,
+    contact_from_source,
+    conversation_text,
     create_manual_lead,
     delete_manual_lead,
+    find_active_lead_by_contact,
     find_manual_lead,
     get_manual_lead,
     purge_expired_manual_leads,
@@ -924,6 +930,39 @@ async def _show_admin_offers(query):
     await query.edit_message_text(text, reply_markup=_admin_keyboard(buttons))
 
 
+def _lead_contact_label(lead):
+    if lead.get("contact_username"):
+        return "@" + lead["contact_username"]
+    return lead.get("contact_display_name") or f"Лид №{lead['id']}"
+
+
+async def _show_client_leads(query):
+    dashboard = client_lead_dashboard()
+    owner = dashboard["waiting_owner"]
+    contact = dashboard["waiting_contact"]
+    partner = dashboard["waiting_partner"]
+    lines = [
+        "👥 Клиенты в работе", "", f"Всего: {dashboard['total']}",
+        f"Ждут наш ответ: {len(owner)}",
+        f"Ждём ответ клиента: {len(contact)}",
+        f"Ждём ответ партнёров: {len(partner)}",
+    ]
+    for heading, items in (
+        ("Ждут наш ответ", owner),
+        ("Ждём ответ клиента", contact),
+        ("Ждём ответ партнёров", partner),
+    ):
+        if items:
+            lines.extend(["", heading + ":"])
+            lines.extend("— " + _lead_contact_label(item) for item in items)
+    buttons = [[(_lead_contact_label(lead), f"lead:view:{lead['id']}")]
+               for lead in owner + contact + partner]
+    buttons.append([("⬅️ В панель", "admin:panel")])
+    await query.edit_message_text(
+        "\n".join(lines)[:4096], reply_markup=_admin_keyboard(buttons)
+    )
+
+
 async def _show_partner_applications(query):
     applications = list_applications()
     if not applications:
@@ -1104,17 +1143,62 @@ def _manual_lead_generator(prompt):
     )
 
 
-def _manual_lead_buttons(lead_id):
-    return _admin_keyboard([
+def _manual_lead_buttons(lead):
+    lead_id = lead["id"] if isinstance(lead, dict) else int(lead)
+    profile_url = lead.get("profile_url") if isinstance(lead, dict) else None
+    source_message_url = lead.get("source_message_url") if isinstance(lead, dict) else None
+    rows = []
+    navigation = []
+    if profile_url:
+        navigation.append(InlineKeyboardButton("👤 Открыть профиль", url=profile_url))
+    if source_message_url:
+        navigation.append(InlineKeyboardButton("💬 Исходное сообщение", url=source_message_url))
+    if navigation:
+        rows.append(navigation)
+    callback_rows = [
         [("✅ Взять в работу", f"lead:work:{lead_id}")],
         [
             ("👤 Это клиент", f"lead:type:{lead_id}:client"),
             ("🤝 Это партнёр", f"lead:type:{lead_id}:partner"),
         ],
         [("🔄 Обновить тексты", f"lead:regen:{lead_id}")],
+    ]
+    if not isinstance(lead, dict) or lead.get("classification") == "client":
+        callback_rows.extend([
+            [("📤 Ответ клиенту отправлен", f"lead:wait:{lead_id}:contact")],
+            [("🤝 Передано партнёрам", f"lead:wait:{lead_id}:partner")],
+            [("📨 Получен ответ партнёра", f"lead:wait:{lead_id}:owner")],
+            [("✅ Завершить", f"lead:close:{lead_id}")],
+        ])
+    callback_rows.extend([
         [("🚫 Не подходит", f"lead:reject:{lead_id}")],
         [("🗑 Удалить данные", f"lead:delete:{lead_id}")],
     ])
+    rows.extend(_admin_keyboard(callback_rows).inline_keyboard)
+    return InlineKeyboardMarkup(rows)
+
+
+def _manual_lead_recommendation(lead):
+    if lead["classification"] == "unclear":
+        return "Сначала определить: это клиент или потенциальный партнёр."
+    if lead["classification"] == "partner":
+        return "Проверить услуги и условия, затем решить, приглашать ли кандидата в партнёрскую сеть."
+    missing = (lead.get("extracted_data") or {}).get("missing") or []
+    if missing:
+        return "Уточнить у клиента: " + "; ".join(missing) + "."
+    categories = set(lead.get("categories") or [])
+    matches = [
+        partner for partner in list_partners()
+        if partner.get("status") == "active"
+        and categories.intersection(partner.get("services") or [])
+    ]
+    if matches:
+        names = ", ".join(partner["name"] for partner in matches[:4])
+        return f"Передать обезличенный запрос подходящим партнёрам: {names}."
+    return (
+        "Подходящего активного партнёра в базе нет: искать решение в интернете "
+        "и параллельно подключать профильного партнёра."
+    )
 
 
 def _format_manual_lead(lead):
@@ -1160,6 +1244,16 @@ def _format_manual_lead(lead):
         or source_meta.get("hidden_sender_name") or known.get("message_source") or "не указан"
     )
     contact = known.get("contact")
+    if lead.get("contact_username"):
+        contact = "@" + lead["contact_username"]
+    elif lead.get("contact_display_name"):
+        contact = lead["contact_display_name"]
+    waiting_label = {
+        "owner": "клиент ждёт наш ответ",
+        "contact": "ждём ответ клиента",
+        "partner": "ждём ответ партнёров",
+        "none": "ожиданий нет",
+    }.get(lead.get("waiting_on"), "требуется решение владельца")
     heading = f"🔎 Найден потенциальный {labels[lead['classification']]}"
     if lead["classification"] == "unclear":
         heading = "🔎 Тип обращения не определён"
@@ -1170,8 +1264,14 @@ def _format_manual_lead(lead):
         f"Что известно:\n{known_text[:500]}\n"
         f"Что уточнить: {missing_text[:350]}\n"
         f"Источник: {source}\n"
-        f"Контакт: {contact or 'не указан'}"
+        f"Контакт: {contact or 'не указан'}\n"
+        f"Состояние: {waiting_label}\n"
+        f"Рекомендация: {_manual_lead_recommendation(lead)}"
     )
+    if lead.get("profile_url"):
+        text += "\nПрофиль: " + lead["profile_url"]
+    if lead.get("source_message_url"):
+        text += "\nИсходное сообщение: " + lead["source_message_url"]
     if lead["classification"] == "unclear":
         text += "\nПричины: " + "; ".join(reasons)
         text += "\n\nВыберите тип вручную, чтобы подготовить коммерческий текст."
@@ -1209,15 +1309,51 @@ async def manual_lead_intake_handler(update, context):
         return
     purge_expired_manual_leads()
     source_chat_id, source_message_id, metadata, source, username = _manual_lead_source(message)
+    contact = contact_from_source(metadata, source_chat_id, source_message_id)
+    active = find_active_lead_by_contact(user.id, contact.get("contact_key"))
+    if active:
+        lead, created = append_manual_lead_message(
+            active["id"], text, source_chat_id=source_chat_id,
+            source_message_id=source_message_id, source_metadata=metadata,
+            contact=contact,
+        )
+        if created:
+            combined = conversation_text(lead["id"])
+            analysis = await run_blocking(
+                build_manual_lead_analysis, combined,
+                username=username, source=source, generator=_manual_lead_generator,
+                forced_classification=(
+                    lead["classification"]
+                    if lead["classification"] in ("client", "partner") else None
+                ),
+            )
+            if analysis["classification"] == "client":
+                analysis["draft"] = build_followup_draft(analysis)
+            lead = update_manual_lead(
+                lead["id"], analysis=analysis, status="in_progress",
+                waiting_on="owner", conversation_state=(
+                    "qualifying" if analysis.get("missing")
+                    else "ready_for_partner"
+                ),
+            )
+        prefix = (
+            "💬 Ответ добавлен к существующему контакту. Контекст обновлён.\n\n"
+            if created else "Повтор уже сохранён — контекст не изменён.\n\n"
+        )
+        await message.reply_text(
+            (prefix + _format_manual_lead(lead))[:4096],
+            reply_markup=_manual_lead_buttons(lead),
+        )
+        raise ApplicationHandlerStop
     existing = find_manual_lead(
         user.id, text, source_chat_id=source_chat_id,
         source_message_id=source_message_id,
-    )
+    ) if not contact.get("contact_key") else None
     if existing:
         prefix = "Повтор уже сохранён — новый лид и новый текст не создавались.\n\n"
         await message.reply_text(
             (prefix + _format_manual_lead(existing))[:4096],
-            reply_markup=_manual_lead_buttons(existing["id"]),
+            reply_markup=_manual_lead_buttons(existing),
         )
         raise ApplicationHandlerStop
     analysis = await run_blocking(
@@ -1227,11 +1363,12 @@ async def manual_lead_intake_handler(update, context):
     lead, created = create_manual_lead(
         user.id, text, analysis, source_chat_id=source_chat_id,
         source_message_id=source_message_id, source_metadata=metadata,
+        contact=contact,
     )
     prefix = "" if created else "Повтор уже сохранён — новый лид и новый текст не создавались.\n\n"
     await message.reply_text(
         (prefix + _format_manual_lead(lead))[:4096],
-        reply_markup=_manual_lead_buttons(lead["id"]),
+        reply_markup=_manual_lead_buttons(lead),
     )
     raise ApplicationHandlerStop
 
@@ -1375,6 +1512,8 @@ async def admin_callback_handler(update, context):
             await _show_admin_cases(query)
         elif query.data == "admin:offers":
             await _show_admin_offers(query)
+        elif query.data == "admin:leads":
+            await _show_client_leads(query)
         elif query.data == "admin:applications":
             await _show_partner_applications(query)
         elif query.data == "admin:partners":
@@ -1527,10 +1666,44 @@ async def admin_callback_handler(update, context):
                 reply_markup=_partner_referral_buttons(referral["id"]),
             )
         elif parts[:2] == ["lead", "work"]:
-            lead = update_manual_lead(int(parts[2]), status="in_progress")
+            lead = update_manual_lead(
+                int(parts[2]), status="in_progress", waiting_on="owner",
+                conversation_state="needs_owner_action",
+            )
             await query.edit_message_text(
                 _format_manual_lead(lead),
-                reply_markup=_manual_lead_buttons(lead["id"]),
+                reply_markup=_manual_lead_buttons(lead),
+            )
+        elif parts[:2] == ["lead", "view"]:
+            lead = get_manual_lead(int(parts[2]))
+            if not lead:
+                raise ManualLeadError("Лид не найден")
+            await query.edit_message_text(
+                _format_manual_lead(lead), reply_markup=_manual_lead_buttons(lead)
+            )
+        elif parts[:2] == ["lead", "wait"]:
+            waiting_on = parts[3]
+            state = {
+                "contact": "waiting_client",
+                "partner": "waiting_partner",
+                "owner": "needs_owner_action",
+            }.get(waiting_on)
+            if state is None:
+                raise ManualLeadError("Неизвестное состояние ожидания")
+            lead = update_manual_lead(
+                int(parts[2]), status="in_progress", waiting_on=waiting_on,
+                conversation_state=state,
+            )
+            await query.edit_message_text(
+                _format_manual_lead(lead), reply_markup=_manual_lead_buttons(lead)
+            )
+        elif parts[:2] == ["lead", "close"]:
+            update_manual_lead(
+                int(parts[2]), status="in_progress", waiting_on="none",
+                conversation_state="closed",
+            )
+            await query.edit_message_text(
+                "✅ Клиентский запрос завершён. Он больше не входит в список активных."
             )
         elif parts[:2] == ["lead", "reject"]:
             lead = update_manual_lead(int(parts[2]), status="rejected")
@@ -1559,7 +1732,7 @@ async def admin_callback_handler(update, context):
             )
             await query.edit_message_text(
                 _format_manual_lead(lead),
-                reply_markup=_manual_lead_buttons(lead["id"]),
+                reply_markup=_manual_lead_buttons(lead),
             )
         elif parts[:2] == ["lead", "regen"]:
             lead = get_manual_lead(int(parts[2]))
@@ -1577,7 +1750,7 @@ async def admin_callback_handler(update, context):
             lead = update_manual_lead(lead["id"], analysis=analysis)
             await query.edit_message_text(
                 _format_manual_lead(lead),
-                reply_markup=_manual_lead_buttons(lead["id"]),
+                reply_markup=_manual_lead_buttons(lead),
             )
         elif parts[:2] == ["relink", "select"]:
             request = get_relink(int(parts[2]))

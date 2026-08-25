@@ -9,10 +9,15 @@ from unittest.mock import AsyncMock, patch
 import bot
 from database import get_connection, init_db
 from manual_leads import (
+    append_manual_lead_message,
     build_analysis,
+    client_lead_dashboard,
+    contact_from_source,
+    conversation_text,
     classify_manual_lead,
     create_manual_lead,
     delete_manual_lead,
+    find_active_lead_by_contact,
     find_manual_lead,
     generation_prompt,
     get_manual_lead,
@@ -396,7 +401,7 @@ class ManualLeadCoreTests(unittest.TestCase):
         try:
             self.assertEqual(
                 [r[0] for r in connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-                list(range(1, 14)),
+                list(range(1, 15)),
             )
             for table, snapshot in before.items():
                 self.assertEqual(
@@ -445,6 +450,17 @@ class ManualLeadBotTests(unittest.IsolatedAsyncioTestCase):
             "find_manual_lead": lambda *args, **kwargs: find_manual_lead(
                 *args, **kwargs, db_path=self.db_path
             ),
+            "find_active_lead_by_contact": lambda *args, **kwargs: find_active_lead_by_contact(
+                *args, **kwargs, db_path=self.db_path
+            ),
+            "append_manual_lead_message": lambda *args, **kwargs: append_manual_lead_message(
+                *args, **kwargs, db_path=self.db_path
+            ),
+            "conversation_text": lambda lead_id: conversation_text(
+                lead_id, self.db_path
+            ),
+            "client_lead_dashboard": lambda: client_lead_dashboard(self.db_path),
+            "list_partners": lambda: [],
             "get_manual_lead": lambda lead_id: get_manual_lead(lead_id, self.db_path),
             "update_manual_lead": lambda lead_id, **kwargs: update_manual_lead(
                 lead_id, **kwargs, db_path=self.db_path
@@ -539,6 +555,80 @@ class ManualLeadBotTests(unittest.IsolatedAsyncioTestCase):
                 await bot.manual_lead_intake_handler(self._update(duplicate), SimpleNamespace())
         self.assertEqual(len(calls), 1)
         self.assertIn("Повтор уже сохранён", duplicate.reply_text.await_args.args[0])
+
+    async def test_forwarded_profile_is_clickable_and_reply_keeps_context(self):
+        sender = SimpleNamespace(id=777001, username="family_phuket", full_name="Семья")
+        origin_one = SimpleNamespace(
+            sender_user=sender, sender_chat=None, chat=None, message_id=31
+        )
+        first = self._message(
+            text="Ищу виллу в Кароне на месяц", message_id=301,
+            forward_origin=origin_one,
+        )
+        await self._handle(first)
+        lead = get_manual_lead(1, self.db_path)
+        self.assertEqual(lead["profile_url"], "https://t.me/family_phuket")
+        profile_buttons = [
+            button for row in first.reply_text.await_args.kwargs["reply_markup"].inline_keyboard
+            for button in row if button.url
+        ]
+        self.assertTrue(any(button.url == "https://t.me/family_phuket" for button in profile_buttons))
+
+        origin_two = SimpleNamespace(
+            sender_user=sender, sender_chat=None, chat=None, message_id=32
+        )
+        reply = self._message(
+            text="Бюджет 150 000 бат, нас четверо", message_id=302,
+            forward_origin=origin_two,
+        )
+        await self._handle(reply)
+        self.assertEqual(self._count("manual_leads"), 1)
+        self.assertEqual(self._count("manual_lead_messages"), 2)
+        updated = get_manual_lead(1, self.db_path)
+        self.assertEqual(updated["status"], "in_progress")
+        self.assertEqual(updated["waiting_on"], "owner")
+        self.assertIn("Ответ добавлен", reply.reply_text.await_args.args[0])
+        self.assertIn("150 000", conversation_text(1, self.db_path))
+
+    async def test_same_short_text_from_different_users_is_not_false_duplicate(self):
+        for index, user_id in enumerate((71001, 71002), start=1):
+            sender = SimpleNamespace(
+                id=user_id, username=f"client{user_id}", full_name=f"Клиент {index}"
+            )
+            origin = SimpleNamespace(
+                sender_user=sender, sender_chat=None, chat=None, message_id=None
+            )
+            await self._handle(self._message(
+                text="Да, актуально", message_id=400 + index, forward_origin=origin,
+            ))
+        self.assertEqual(self._count("manual_leads"), 2)
+
+    async def test_waiting_dashboard_and_close_lifecycle(self):
+        analysis = build_analysis("Ищу квартиру в Кароне")
+        lead, _ = create_manual_lead(
+            self.admin_id, "Ищу квартиру в Кароне", analysis,
+            contact={"contact_key": "user:44", "contact_username": "client44"},
+            db_path=self.db_path,
+        )
+        context = SimpleNamespace(bot=SimpleNamespace())
+
+        async def callback(data):
+            query = SimpleNamespace(data=data, answer=AsyncMock(), edit_message_text=AsyncMock())
+            update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=self.admin_id))
+            with self._patches():
+                await bot.admin_callback_handler(update, context)
+            return query
+
+        await callback(f"lead:wait:{lead['id']}:contact")
+        dashboard = client_lead_dashboard(self.db_path)
+        self.assertEqual(len(dashboard["waiting_contact"]), 1)
+        query = await callback("admin:leads")
+        self.assertIn("Ждём ответ клиента: 1", query.edit_message_text.await_args.args[0])
+        self.assertIn("@client44", query.edit_message_text.await_args.args[0])
+        await callback(f"lead:wait:{lead['id']}:partner")
+        self.assertEqual(len(client_lead_dashboard(self.db_path)["waiting_partner"]), 1)
+        await callback(f"lead:close:{lead['id']}")
+        self.assertEqual(client_lead_dashboard(self.db_path)["total"], 0)
 
     async def test_manual_type_regenerate_work_and_reject(self):
         analysis = build_analysis("Есть интересное предложение")

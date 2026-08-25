@@ -18,6 +18,7 @@ def can_access_admin_panel(admin_user_id, user_id):
 def admin_panel_buttons():
     return [
         [("🗂 Кейсы", "admin:cases"), ("📋 Предложения", "admin:offers")],
+        [("👥 Клиенты в работе", "admin:leads")],
         [("🤝 Партнёры", "admin:partners")],
         [("📝 Заявки партнёров", "admin:applications")],
         [("📩 Запросы партнёрам", "admin:requests")],

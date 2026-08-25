@@ -477,6 +477,120 @@ def _migration_013_partner_invite_expiry(connection):
         )
 
 
+def _migration_014_manual_lead_conversations(connection):
+    columns = _column_names(connection, "manual_leads")
+    additions = (
+        ("contact_key", "TEXT"),
+        ("contact_display_name", "TEXT"),
+        ("contact_username", "TEXT"),
+        ("contact_telegram_user_id", "INTEGER"),
+        ("profile_url", "TEXT"),
+        ("source_message_url", "TEXT"),
+        ("conversation_state", "TEXT NOT NULL DEFAULT 'new'"),
+        ("waiting_on", "TEXT NOT NULL DEFAULT 'owner'"),
+        ("last_message_at", "TEXT"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE manual_leads ADD COLUMN {name} {definition}"
+            )
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS manual_lead_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL,
+            direction TEXT NOT NULL,
+            message_fingerprint TEXT NOT NULL,
+            source_chat_id INTEGER,
+            source_message_id INTEGER,
+            source_metadata TEXT NOT NULL DEFAULT '{}',
+            original_text TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (lead_id) REFERENCES manual_leads(id) ON DELETE CASCADE,
+            UNIQUE(lead_id, message_fingerprint)
+        );
+        CREATE INDEX IF NOT EXISTS idx_manual_lead_messages_lead
+            ON manual_lead_messages(lead_id, id);
+        CREATE INDEX IF NOT EXISTS idx_manual_leads_contact
+            ON manual_leads(owner_telegram_id, contact_key, id);
+        CREATE INDEX IF NOT EXISTS idx_manual_leads_waiting
+            ON manual_leads(classification, status, waiting_on, id);
+        """
+    )
+
+    for row in connection.execute(
+        """SELECT id, owner_telegram_id, source_chat_id, source_message_id,
+                  source_metadata, original_text, normalized_content_hash,
+                  classification, status, created_at, updated_at
+           FROM manual_leads ORDER BY id"""
+    ).fetchall():
+        (lead_id, owner_id, source_chat_id, source_message_id, metadata_json,
+         original_text, fingerprint, classification, status, created_at,
+         updated_at) = row
+        try:
+            metadata = json.loads(metadata_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        user_id = metadata.get("source_user_id")
+        username = str(metadata.get("source_username") or "").lstrip("@") or None
+        display_name = (
+            metadata.get("source_name")
+            or metadata.get("hidden_sender_name")
+            or username
+        )
+        if user_id:
+            contact_key = f"user:{int(user_id)}"
+        elif username:
+            contact_key = "username:" + username.casefold()
+        elif metadata.get("hidden_sender_name") and source_chat_id is not None:
+            hidden = " ".join(str(metadata["hidden_sender_name"]).casefold().split())
+            contact_key = f"hidden:{source_chat_id}:{hidden}"
+        else:
+            contact_key = None
+        profile_url = (
+            f"https://t.me/{username}" if username
+            else f"tg://user?id={int(user_id)}" if user_id else None
+        )
+        chat_username = str(metadata.get("source_chat_username") or "").lstrip("@")
+        if chat_username and source_message_id:
+            message_url = f"https://t.me/{chat_username}/{int(source_message_id)}"
+        elif source_chat_id and source_message_id and str(source_chat_id).startswith("-100"):
+            message_url = (
+                "https://t.me/c/" + str(source_chat_id)[4:]
+                + f"/{int(source_message_id)}"
+            )
+        else:
+            message_url = None
+        state = (
+            "closed" if status == "rejected"
+            else "qualifying" if classification == "client"
+            else "new"
+        )
+        connection.execute(
+            """UPDATE manual_leads
+               SET contact_key=?, contact_display_name=?, contact_username=?,
+                   contact_telegram_user_id=?, profile_url=?, source_message_url=?,
+                   conversation_state=?, waiting_on=?, last_message_at=?
+               WHERE id=?""",
+            (
+                contact_key, display_name, username, user_id, profile_url,
+                message_url, state, "none" if state == "closed" else "owner",
+                updated_at or created_at, lead_id,
+            ),
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO manual_lead_messages
+               (lead_id, direction, message_fingerprint, source_chat_id,
+                source_message_id, source_metadata, original_text, created_at)
+               VALUES (?, 'incoming_contact', ?, ?, ?, ?, ?, ?)""",
+            (
+                lead_id, fingerprint, source_chat_id, source_message_id,
+                metadata_json or "{}", original_text, created_at,
+            ),
+        )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
@@ -491,6 +605,7 @@ MIGRATIONS = (
     (11, _migration_011_two_stage_partner_onboarding),
     (12, _migration_012_manual_leads),
     (13, _migration_013_partner_invite_expiry),
+    (14, _migration_014_manual_lead_conversations),
 )
 
 

@@ -166,7 +166,7 @@ class TwoStageMigrationTests(unittest.TestCase):
                 self.assertEqual(
                     [row[0] for row in connection.execute(
                         "SELECT version FROM schema_migrations ORDER BY version"
-                    )], list(range(1, 14)),
+                    )], list(range(1, 15)),
                 )
             finally:
                 connection.close()

@@ -80,7 +80,7 @@ class AdminUiTests(unittest.IsolatedAsyncioTestCase):
         labels = [label for row in admin_panel_buttons() for label, _ in row]
         self.assertEqual(
             labels,
-            ["🗂 Кейсы", "📋 Предложения", "🤝 Партнёры",
+            ["🗂 Кейсы", "📋 Предложения", "👥 Клиенты в работе", "🤝 Партнёры",
              "📝 Заявки партнёров",
              "📩 Запросы партнёрам", "⚙️ Настройки"],
         )

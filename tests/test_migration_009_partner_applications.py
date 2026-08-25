@@ -100,7 +100,7 @@ class PartnerApplicationsMigrationTests(unittest.TestCase):
             self.assertEqual(json.loads(candidate[2]), ["housing"])
             self.assertEqual(candidate[3], 0.8)
             self.assertIsNotNone(applications_table)
-            self.assertEqual(versions, list(range(1, 14)))
+            self.assertEqual(versions, list(range(1, 15)))
 
 
 if __name__ == "__main__":

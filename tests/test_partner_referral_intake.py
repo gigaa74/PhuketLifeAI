@@ -168,7 +168,7 @@ class PartnerReferralIntakeTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0],
-                13,
+                14,
             )
             self.assertIsNotNone(connection.execute(
                 """SELECT name FROM sqlite_master

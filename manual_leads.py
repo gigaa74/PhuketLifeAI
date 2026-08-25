@@ -12,6 +12,11 @@ from reliability import safe_log
 
 LEAD_TYPES = {"client", "partner", "unclear"}
 LEAD_STATUSES = {"needs_review", "ready", "in_progress", "rejected"}
+WAITING_ON = {"owner", "contact", "partner", "none"}
+CONVERSATION_STATES = {
+    "new", "qualifying", "ready_for_partner", "waiting_client",
+    "waiting_partner", "needs_owner_action", "closed",
+}
 MANUAL_LEAD_RETENTION_DAYS = 30
 
 _EMAIL_PATTERN = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?!\w)")
@@ -69,6 +74,50 @@ def normalize_content(text):
 
 def content_hash(text):
     return hashlib.sha256(normalize_content(text).encode("utf-8")).hexdigest()
+
+
+def contact_from_source(metadata, source_chat_id=None, source_message_id=None):
+    """Build local Telegram identity and navigation links from Bot API metadata."""
+    metadata = metadata or {}
+    user_id = metadata.get("source_user_id")
+    username = str(metadata.get("source_username") or "").strip().lstrip("@") or None
+    display_name = (
+        metadata.get("source_name")
+        or metadata.get("hidden_sender_name")
+        or username
+    )
+    if user_id:
+        contact_key = f"user:{int(user_id)}"
+    elif username:
+        contact_key = "username:" + username.casefold()
+    elif metadata.get("hidden_sender_name") and source_chat_id is not None:
+        hidden = normalize_content(metadata["hidden_sender_name"])
+        contact_key = f"hidden:{source_chat_id}:{hidden}"
+    else:
+        contact_key = None
+
+    profile_url = (
+        f"https://t.me/{username}" if username
+        else f"tg://user?id={int(user_id)}" if user_id else None
+    )
+    chat_username = str(metadata.get("source_chat_username") or "").strip().lstrip("@")
+    if chat_username and source_message_id:
+        source_message_url = f"https://t.me/{chat_username}/{int(source_message_id)}"
+    elif source_chat_id and source_message_id and str(source_chat_id).startswith("-100"):
+        source_message_url = (
+            "https://t.me/c/" + str(source_chat_id)[4:]
+            + f"/{int(source_message_id)}"
+        )
+    else:
+        source_message_url = None
+    return {
+        "contact_key": contact_key,
+        "contact_display_name": display_name,
+        "contact_username": username,
+        "contact_telegram_user_id": int(user_id) if user_id else None,
+        "profile_url": profile_url,
+        "source_message_url": source_message_url,
+    }
 
 
 def redact_personal_data(text):
@@ -634,8 +683,15 @@ def _decode(row):
 
 def create_manual_lead(owner_telegram_id, original_text, analysis, *,
                        source_chat_id=None, source_message_id=None,
-                       source_metadata=None, db_path=None):
-    normalized_hash = content_hash(original_text)
+                       source_metadata=None, contact=None, db_path=None):
+    contact = contact or contact_from_source(
+        source_metadata, source_chat_id, source_message_id
+    )
+    message_fingerprint = content_hash(original_text)
+    normalized_hash = (
+        content_hash(contact["contact_key"] + "\n" + normalize_content(original_text))
+        if contact.get("contact_key") else message_fingerprint
+    )
     stored_text = redact_personal_data(original_text)
     connection = get_connection(db_path); connection.row_factory = sqlite3.Row
     try:
@@ -644,6 +700,15 @@ def create_manual_lead(owner_telegram_id, original_text, analysis, *,
                 existing = connection.execute(
                     "SELECT * FROM manual_leads WHERE source_chat_id=? AND source_message_id=?",
                     (int(source_chat_id), int(source_message_id)),
+                ).fetchone()
+            elif contact.get("contact_key"):
+                existing = connection.execute(
+                    """SELECT ml.* FROM manual_leads ml
+                       JOIN manual_lead_messages mm ON mm.lead_id=ml.id
+                       WHERE ml.owner_telegram_id=? AND ml.contact_key=?
+                         AND mm.message_fingerprint=?
+                       ORDER BY ml.id DESC LIMIT 1""",
+                    (int(owner_telegram_id), contact["contact_key"], message_fingerprint),
                 ).fetchone()
             else:
                 existing = connection.execute(
@@ -654,13 +719,23 @@ def create_manual_lead(owner_telegram_id, original_text, analysis, *,
                 ).fetchone()
             if existing:
                 return _decode(existing), False
+            state = (
+                "qualifying" if analysis["classification"] == "client" and analysis["missing"]
+                else "ready_for_partner" if analysis["classification"] == "client"
+                else "new"
+            )
+            now = _now()
             cursor = connection.execute(
                 """INSERT INTO manual_leads
                    (owner_telegram_id, source_chat_id, source_message_id,
                     source_metadata, original_text, normalized_content_hash,
                     classification, categories, extracted_data, generated_draft,
-                    status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, updated_at, contact_key, contact_display_name,
+                    contact_username, contact_telegram_user_id, profile_url,
+                    source_message_url, conversation_state, waiting_on,
+                    last_message_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, 'owner', ?)""",
                 (int(owner_telegram_id), source_chat_id, source_message_id,
                  json.dumps(source_metadata or {}, ensure_ascii=False), stored_text,
                  normalized_hash, analysis["classification"],
@@ -668,9 +743,26 @@ def create_manual_lead(owner_telegram_id, original_text, analysis, *,
                  json.dumps(_analysis_payload(analysis), ensure_ascii=False),
                  analysis.get("draft"),
                  "needs_review" if analysis["classification"] == "unclear" else "ready",
-                 _now()),
+                 now, contact.get("contact_key"),
+                 contact.get("contact_display_name"),
+                 contact.get("contact_username"),
+                 contact.get("contact_telegram_user_id"),
+                 contact.get("profile_url"), contact.get("source_message_url"),
+                 state, now),
             )
-            row = connection.execute("SELECT * FROM manual_leads WHERE id=?", (cursor.lastrowid,)).fetchone()
+            lead_id = cursor.lastrowid
+            connection.execute(
+                """INSERT INTO manual_lead_messages
+                   (lead_id, direction, message_fingerprint, source_chat_id,
+                    source_message_id, source_metadata, original_text, created_at)
+                   VALUES (?, 'incoming_contact', ?, ?, ?, ?, ?, ?)""",
+                (
+                    lead_id, message_fingerprint, source_chat_id, source_message_id,
+                    json.dumps(source_metadata or {}, ensure_ascii=False),
+                    stored_text, now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM manual_leads WHERE id=?", (lead_id,)).fetchone()
         return _decode(row), True
     finally:
         connection.close()
@@ -705,6 +797,135 @@ def get_manual_lead(lead_id, db_path=None):
         connection.close()
 
 
+def find_active_lead_by_contact(owner_telegram_id, contact_key, db_path=None):
+    if not contact_key:
+        return None
+    connection = get_connection(db_path); connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            """SELECT * FROM manual_leads
+               WHERE owner_telegram_id=? AND contact_key=?
+                 AND status!='rejected' AND conversation_state!='closed'
+               ORDER BY id DESC LIMIT 1""",
+            (int(owner_telegram_id), str(contact_key)),
+        ).fetchone()
+        return _decode(row)
+    finally:
+        connection.close()
+
+
+def get_manual_lead_messages(lead_id, db_path=None):
+    connection = get_connection(db_path); connection.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in connection.execute(
+            "SELECT * FROM manual_lead_messages WHERE lead_id=? ORDER BY id",
+            (int(lead_id),),
+        ).fetchall()]
+    finally:
+        connection.close()
+
+
+def append_manual_lead_message(
+    lead_id, original_text, *, direction="incoming_contact",
+    source_chat_id=None, source_message_id=None, source_metadata=None,
+    contact=None, db_path=None,
+):
+    fingerprint = content_hash(original_text)
+    safe_text = redact_personal_data(original_text)
+    now = _now()
+    connection = get_connection(db_path)
+    created = True
+    try:
+        with connection:
+            try:
+                connection.execute(
+                    """INSERT INTO manual_lead_messages
+                       (lead_id, direction, message_fingerprint, source_chat_id,
+                        source_message_id, source_metadata, original_text, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        int(lead_id), direction, fingerprint, source_chat_id,
+                        source_message_id,
+                        json.dumps(source_metadata or {}, ensure_ascii=False),
+                        safe_text, now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                created = False
+            if created:
+                contact = contact or {}
+                connection.execute(
+                    """UPDATE manual_leads SET
+                       contact_key=COALESCE(?, contact_key),
+                       contact_display_name=COALESCE(?, contact_display_name),
+                       contact_username=COALESCE(?, contact_username),
+                       contact_telegram_user_id=COALESCE(?, contact_telegram_user_id),
+                       profile_url=COALESCE(?, profile_url),
+                       source_message_url=COALESCE(?, source_message_url),
+                       status='in_progress', waiting_on='owner',
+                       conversation_state='needs_owner_action',
+                       last_message_at=?, updated_at=? WHERE id=?""",
+                    (
+                        contact.get("contact_key"), contact.get("contact_display_name"),
+                        contact.get("contact_username"),
+                        contact.get("contact_telegram_user_id"),
+                        contact.get("profile_url"), contact.get("source_message_url"),
+                        now, now, int(lead_id),
+                    ),
+                )
+        return get_manual_lead(lead_id, db_path), created
+    finally:
+        connection.close()
+
+
+def conversation_text(lead_id, db_path=None):
+    return "\n".join(
+        message["original_text"]
+        for message in get_manual_lead_messages(lead_id, db_path)
+        if message.get("direction") == "incoming_contact"
+    )
+
+
+def build_followup_draft(analysis):
+    if analysis["classification"] != "client":
+        return analysis.get("draft")
+    missing = analysis.get("missing") or []
+    if missing:
+        questions = _natural_client_questions(missing, analysis.get("extracted") or {})
+        return (
+            "Спасибо, данные зафиксировали. " + questions
+            + " После этого сможем передать полный запрос профильным партнёрам."
+        )
+    return (
+        "Спасибо, теперь данных достаточно. Мы передадим запрос профильным "
+        "партнёрам и вернёмся к Вам с подтверждёнными вариантами, стоимостью "
+        "и условиями."
+    )
+
+
+def list_active_client_leads(db_path=None):
+    connection = get_connection(db_path); connection.row_factory = sqlite3.Row
+    try:
+        return [_decode(row) for row in connection.execute(
+            """SELECT * FROM manual_leads
+               WHERE classification='client' AND status='in_progress'
+                 AND conversation_state!='closed'
+               ORDER BY last_message_at DESC, id DESC"""
+        ).fetchall()]
+    finally:
+        connection.close()
+
+
+def client_lead_dashboard(db_path=None):
+    leads = list_active_client_leads(db_path)
+    return {
+        "total": len(leads),
+        "waiting_owner": [lead for lead in leads if lead.get("waiting_on") == "owner"],
+        "waiting_contact": [lead for lead in leads if lead.get("waiting_on") == "contact"],
+        "waiting_partner": [lead for lead in leads if lead.get("waiting_on") == "partner"],
+    }
+
+
 def delete_manual_lead(lead_id, db_path=None):
     connection = get_connection(db_path)
     try:
@@ -735,6 +956,15 @@ def purge_expired_manual_leads(*, retention_days=MANUAL_LEAD_RETENTION_DAYS,
                         "UPDATE manual_leads SET original_text=?, updated_at=? WHERE id=?",
                         (safe_text, _now(), row[0]),
                     )
+            for row in connection.execute(
+                "SELECT id, original_text FROM manual_lead_messages"
+            ).fetchall():
+                safe_text = redact_personal_data(row[1])
+                if safe_text != row[1]:
+                    connection.execute(
+                        "UPDATE manual_lead_messages SET original_text=? WHERE id=?",
+                        (safe_text, row[0]),
+                    )
             cursor = connection.execute(
                 "DELETE FROM manual_leads WHERE julianday(created_at) <= julianday(?)",
                 (cutoff.isoformat(),),
@@ -745,11 +975,16 @@ def purge_expired_manual_leads(*, retention_days=MANUAL_LEAD_RETENTION_DAYS,
 
 
 def update_manual_lead(lead_id, *, classification=None, status=None,
-                       analysis=None, db_path=None):
+                       analysis=None, waiting_on=None,
+                       conversation_state=None, db_path=None):
     if classification is not None and classification not in LEAD_TYPES:
         raise ManualLeadError("Недопустимый тип лида")
     if status is not None and status not in LEAD_STATUSES:
         raise ManualLeadError("Недопустимый статус лида")
+    if waiting_on is not None and waiting_on not in WAITING_ON:
+        raise ManualLeadError("Недопустимое состояние ожидания")
+    if conversation_state is not None and conversation_state not in CONVERSATION_STATES:
+        raise ManualLeadError("Недопустимая стадия диалога")
     connection = get_connection(db_path)
     try:
         fields, values = [], []
@@ -763,6 +998,10 @@ def update_manual_lead(lead_id, *, classification=None, status=None,
             values += [json.dumps(analysis["categories"], ensure_ascii=False),
                        json.dumps(_analysis_payload(analysis), ensure_ascii=False),
                        analysis.get("draft")]
+        if waiting_on is not None:
+            fields.append("waiting_on=?"); values.append(waiting_on)
+        if conversation_state is not None:
+            fields.append("conversation_state=?"); values.append(conversation_state)
         fields.append("updated_at=?"); values.append(_now()); values.append(int(lead_id))
         with connection:
             cursor = connection.execute("UPDATE manual_leads SET " + ", ".join(fields) + " WHERE id=?", values)
