@@ -49,7 +49,7 @@ def housing_case(data, status="active"):
 class ConversationPolicyTests(unittest.TestCase):
     def test_standard_identity_is_versioned(self):
         self.assertEqual(CONVERSATION_STANDARD_ID, "STD-001")
-        self.assertEqual(CONVERSATION_STANDARD_VERSION, "1.0")
+        self.assertEqual(CONVERSATION_STANDARD_VERSION, "1.1")
 
     def test_incomplete_housing_asks_only_required_missing_fields(self):
         plan = evaluate_information_state("Нужно жильё на Пхукете")
@@ -283,10 +283,17 @@ class ConversationPolicyTests(unittest.TestCase):
             housing_case({"location": "Kata", "people": "2"}),
         )
         prompt = build_conversation_policy_prompt(plan)
-        self.assertIn("STD-001 v1.0", prompt)
+        self.assertIn("STD-001 v1.1", prompt)
         self.assertIn('"location": "Kata"', prompt)
         self.assertIn("не показывай клиенту", prompt)
         self.assertIn("Не повторяй", prompt)
+        self.assertIn("Не подменяй неизвестную", prompt)
+        self.assertIn("персональные данные", prompt)
+        self.assertIn("явного решения владельца", prompt)
+
+    def test_truthful_fallback_uses_team_voice(self):
+        self.assertTrue(TRUTHFUL_FALLBACK.startswith("Мы можем"))
+        self.assertNotIn("Я могу", TRUTHFUL_FALLBACK)
 
 
 class GoldenConversationPolicyTests(unittest.TestCase):

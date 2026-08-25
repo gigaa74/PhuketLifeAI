@@ -174,6 +174,10 @@ class ManualLeadCoreTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, prompt)
         self.assertIn("Карон", prompt)
+        self.assertIn("STD-001 v1.1", prompt)
+        self.assertIn("Не подменяй неизвестную категорию", prompt)
+        self.assertIn("минимально необходимые персональные данные", prompt)
+        self.assertIn("только после решения владельца", prompt)
 
     def test_storage_is_redacted_and_expired_leads_can_be_purged(self):
         raw = "Ищу квартиру, связь +7 999 123-45-67 или @private_user"
