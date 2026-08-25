@@ -6,6 +6,7 @@ from geo_relevance import (
     result_has_phuket_geo_evidence,
 )
 from search_presentation import CONCRETE_PROPERTY, LISTING_PAGE
+from reliability import safe_log
 
 
 SEARCH_WITH_RESULTS = "with_results"
@@ -943,11 +944,13 @@ class HousingSearchEngine:
                             normalized
                         )
 
-            except Exception as e:
+            except Exception as error:
                 provider_errors.append(provider.name)
-                print(
-                    "[SEARCH] Ошибка источника "
-                    f"{provider.name}: {e}"
+                safe_log(
+                    "search_provider_failed",
+                    level="error",
+                    error=error,
+                    provider=provider.name,
                 )
 
         all_results = self.remove_duplicates(
@@ -1130,16 +1133,10 @@ def search_housing(
         }
     )
 
-    print(
-        "\n===== HOUSING SEARCH REQUEST ====="
-    )
-
-    print(
-        search_request
-    )
-
-    print(
-        "===================================\n"
+    safe_log(
+        "housing_search_started",
+        result_limit=search_request["result_limit"],
+        repeat_search=search_request["repeat_search"],
     )
 
     if providers is None:
@@ -1147,8 +1144,12 @@ def search_housing(
 
         try:
             providers = [YandexSearchProvider()]
-        except Exception as e:
-            print(f"[SEARCH] Ошибка инициализации источника: {e}")
+        except Exception as error:
+            safe_log(
+                "search_provider_initialization_failed",
+                level="error",
+                error=error,
+            )
             return {
                 "success": False,
                 "status": SEARCH_PROVIDER_ERROR,

@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 
 from dotenv import load_dotenv
 from config import load_settings
+from reliability import retry_call
 
 
 load_dotenv()
@@ -17,6 +18,8 @@ class YandexSearchProvider:
         settings = load_settings()
         self.api_key = settings.yandex_search_api_key
         self.folder_id = settings.yandex_folder_id
+        self.retry_attempts = settings.external_retry_attempts
+        self.retry_base_delay_seconds = settings.external_retry_base_delay_seconds
 
         self.url = "https://searchapi.api.cloud.yandex.net/v2/web/search"
 
@@ -49,10 +52,18 @@ class YandexSearchProvider:
                 },
             }
             try:
-                response = requests.post(
-                    self.url, headers=headers, json=payload, timeout=30
+                def request_search():
+                    response = requests.post(
+                        self.url, headers=headers, json=payload, timeout=30
+                    )
+                    response.raise_for_status()
+                    return response
+
+                response = retry_call(
+                    request_search,
+                    attempts=self.retry_attempts,
+                    base_delay_seconds=self.retry_base_delay_seconds,
                 )
-                response.raise_for_status()
                 raw_data = response.json().get("rawData")
                 successful_queries += 1
             except requests.RequestException as error:

@@ -3,6 +3,7 @@
 import time
 
 from gigachat import GigaChat
+from reliability import retry_call, safe_log
 
 
 class GigaChatGenerationError(RuntimeError):
@@ -52,6 +53,8 @@ def generate_text(
     temperature=0.7,
     stage="other",
     correlation_id=None,
+    retry_attempts=3,
+    retry_base_delay_seconds=0.5,
 ):
     """Generate text through the official SDK and preserve the text contract."""
     client_options = {
@@ -81,24 +84,27 @@ def generate_text(
     started_at = time.perf_counter()
     client = GigaChat(**client_options)
     try:
-        response = client.chat.create({
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-        })
+        response = retry_call(
+            lambda: client.chat.create({
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+            }),
+            attempts=retry_attempts,
+            base_delay_seconds=retry_base_delay_seconds,
+        )
         return normalize_response_content(response.messages[-1].content)
     except Exception as error:
-        cause = error.__cause__ or error.__context__
-        print(
-            "[GENERATION_FAILURE] "
-            f"correlation_id={correlation_id if correlation_id is not None else 'none'} "
-            f"stage={stage} "
-            f"latency_ms={round((time.perf_counter() - started_at) * 1000)} "
-            f"prompt_chars={prompt_chars} "
-            f"prompt_bytes={prompt_bytes} "
-            f"messages_count={len(messages)} "
-            f"exception_type={type(error).__name__} "
-            f"cause_type={type(cause).__name__ if cause is not None else 'None'}"
+        safe_log(
+            "generation_failure",
+            level="error",
+            error=error,
+            correlation_id=correlation_id if correlation_id is not None else "none",
+            stage=stage,
+            latency_ms=round((time.perf_counter() - started_at) * 1000),
+            prompt_chars=prompt_chars,
+            prompt_bytes=prompt_bytes,
+            messages_count=len(messages),
         )
         raise GigaChatGenerationError("GigaChat generation failed") from error
     finally:

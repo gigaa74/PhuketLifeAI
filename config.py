@@ -17,6 +17,10 @@ class Settings:
     telegram_admin_user_id: int | None = None
     partner_handoff_mode: str = "review"
     gigachat_timeout_seconds: float = 30.0
+    client_rate_limit_requests: int = 10
+    client_rate_limit_window_seconds: float = 60.0
+    external_retry_attempts: int = 3
+    external_retry_base_delay_seconds: float = 0.5
 
     @property
     def gigachat_tls_verify(self):
@@ -72,6 +76,37 @@ def load_settings(environ=None):
             "GIGACHAT_TIMEOUT_SECONDS должен быть положительным числом"
         )
 
+    def positive_number(name, default, cast, maximum=None):
+        raw_value = values.get(name, str(default)).strip()
+        try:
+            parsed = cast(raw_value)
+        except ValueError as error:
+            raise ConfigurationError(
+                f"{name} должен быть положительным числом"
+            ) from error
+        if parsed <= 0:
+            raise ConfigurationError(
+                f"{name} должен быть положительным числом"
+            )
+        if maximum is not None and parsed > maximum:
+            raise ConfigurationError(
+                f"{name} не должен превышать {maximum}"
+            )
+        return parsed
+
+    client_rate_limit_requests = positive_number(
+        "CLIENT_RATE_LIMIT_REQUESTS", 10, int, 1000
+    )
+    client_rate_limit_window_seconds = positive_number(
+        "CLIENT_RATE_LIMIT_WINDOW_SECONDS", 60, float, 86400
+    )
+    external_retry_attempts = positive_number(
+        "EXTERNAL_RETRY_ATTEMPTS", 3, int, 5
+    )
+    external_retry_base_delay_seconds = positive_number(
+        "EXTERNAL_RETRY_BASE_DELAY_SECONDS", 0.5, float, 60
+    )
+
     return Settings(
         telegram_bot_token=values["TELEGRAM_BOT_TOKEN"].strip(),
         gigachat_api_key=values["GIGACHAT_API_KEY"].strip(),
@@ -81,4 +116,8 @@ def load_settings(environ=None):
         telegram_admin_user_id=admin_user_id,
         partner_handoff_mode=handoff_mode,
         gigachat_timeout_seconds=gigachat_timeout_seconds,
+        client_rate_limit_requests=client_rate_limit_requests,
+        client_rate_limit_window_seconds=client_rate_limit_window_seconds,
+        external_retry_attempts=external_retry_attempts,
+        external_retry_base_delay_seconds=external_retry_base_delay_seconds,
     )

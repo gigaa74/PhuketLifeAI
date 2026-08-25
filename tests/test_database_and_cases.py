@@ -44,6 +44,21 @@ class DatabaseAndCaseTests(unittest.TestCase):
         )
         self.assertEqual(versions, list(range(1, 13)))
 
+    def test_file_database_uses_wal_and_safe_busy_settings(self):
+        connection = get_connection(self.db_path)
+        try:
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            synchronous = connection.execute("PRAGMA synchronous").fetchone()[0]
+            busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+            foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertEqual(journal_mode.casefold(), "wal")
+        self.assertEqual(synchronous, 1)
+        self.assertEqual(busy_timeout, 5000)
+        self.assertEqual(foreign_keys, 1)
+
     def test_client_case_creation_update_and_ready_transition(self):
         client_id = get_or_create_client(
             123456,

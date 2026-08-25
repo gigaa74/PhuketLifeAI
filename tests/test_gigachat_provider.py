@@ -1,5 +1,6 @@
 import inspect
 import io
+import json
 import unittest
 import asyncio
 from contextlib import redirect_stdout
@@ -7,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import bot
+import client_ai
+import client_handler
 from truthfulness import GENERATION_DELAY_MESSAGE
 from gigachat_provider import (
     GigaChatGenerationError,
@@ -83,19 +86,58 @@ class GigaChatProviderTests(unittest.TestCase):
             )
 
         log = output.getvalue()
-        for field in (
-            "correlation_id=12345",
-            "stage=analyze_case",
-            "latency_ms=",
-            f"prompt_chars={len(client_text)}",
-            f"prompt_bytes={len(client_text.encode('utf-8'))}",
-            "messages_count=1",
-            "exception_type=RuntimeError",
-            "cause_type=TimeoutError",
-        ):
-            self.assertIn(field, log)
+        record = json.loads(log)
+        self.assertEqual(record["correlation_id"], 12345)
+        self.assertEqual(record["stage"], "analyze_case")
+        self.assertIn("latency_ms", record)
+        self.assertEqual(record["prompt_chars"], len(client_text))
+        self.assertEqual(record["prompt_bytes"], len(client_text.encode("utf-8")))
+        self.assertEqual(record["messages_count"], 1)
+        self.assertEqual(record["exception_type"], "RuntimeError")
+        self.assertEqual(record["cause_type"], "TimeoutError")
         for secret in (client_text, token, "private provider response", "transport detail"):
             self.assertNotIn(secret, log)
+
+    @patch("reliability.time.sleep", return_value=None)
+    @patch("gigachat_provider.GigaChat")
+    def test_transient_sdk_failure_is_retried(self, sdk_class, sleep):
+        client = sdk_class.return_value
+        client.chat.create.side_effect = [
+            TimeoutError("temporary private detail"),
+            self.sdk_response("готово"),
+        ]
+
+        result = generate_text(
+            [{"role": "user", "content": "test"}],
+            access_token="secret-token",
+            model="GigaChat-2-Max",
+            timeout=30,
+            retry_attempts=2,
+            retry_base_delay_seconds=0.1,
+        )
+
+        self.assertEqual(result, "готово")
+        self.assertEqual(client.chat.create.call_count, 2)
+        sleep.assert_called_once_with(0.1)
+
+    def test_client_rate_limit_stops_before_database_and_generation(self):
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=555),
+            message=SimpleNamespace(
+                text="Ищу жильё",
+                reply_text=AsyncMock(),
+            ),
+        )
+        with (
+            patch("client_handler.CLIENT_RATE_LIMITER.allow", return_value=False),
+            patch("client_handler.get_or_create_client") as get_client,
+            patch("client_handler.ask_gigachat") as generation,
+        ):
+            asyncio.run(bot.handle_message(update, SimpleNamespace()))
+
+        get_client.assert_not_called()
+        generation.assert_not_called()
+        update.message.reply_text.assert_awaited_once_with(bot.RATE_LIMIT_MESSAGE)
 
     def test_analyze_transport_failure_stops_second_generation(self):
         update = SimpleNamespace(
@@ -116,26 +158,28 @@ class GigaChatProviderTests(unittest.TestCase):
         routing = {"intent": "new_case", "category": "housing"}
 
         with (
-            patch("bot.get_or_create_client", return_value=1),
-            patch("bot.save_message"),
-            patch("bot.pure_greeting_response", return_value=None),
-            patch("bot.get_history", return_value=[]),
-            patch("bot.get_client_active_case", return_value=None),
-            patch("bot.plan_response", return_value=response_plan),
-            patch("bot.select_answer_source", return_value="model"),
-            patch("bot.route_with_conversation_policy", return_value=routing),
-            patch("bot.apply_case_continuity", return_value=routing),
-            patch("bot.should_use_conversation_flow", return_value=False),
+            patch("client_handler.get_or_create_client", return_value=1),
+            patch("client_handler.save_message"),
+            patch("client_handler.pure_greeting_response", return_value=None),
+            patch("client_handler.get_history", return_value=[]),
+            patch("client_handler.get_client_active_case", return_value=None),
+            patch("client_handler.plan_response", return_value=response_plan),
+            patch("client_handler.select_answer_source", return_value="model"),
+            patch("client_handler.route_with_conversation_policy", return_value=routing),
+            patch("client_handler.apply_case_continuity", return_value=routing),
+            patch("client_handler.should_use_conversation_flow", return_value=False),
             patch(
-                "bot.run_blocking",
+                "client_handler.run_blocking",
                 new=AsyncMock(side_effect=GigaChatGenerationError),
             ) as run_blocking,
-            patch("bot.ask_gigachat") as ask_gigachat,
+            patch("client_handler.persist_case_analysis") as persist_case,
+            patch("client_handler.ask_gigachat") as ask_gigachat,
         ):
             asyncio.run(bot.handle_message(update, SimpleNamespace()))
 
         self.assertEqual(run_blocking.await_count, 1)
         ask_gigachat.assert_not_called()
+        persist_case.assert_not_called()
         update.message.reply_text.assert_awaited_once_with(GENERATION_DELAY_MESSAGE)
         safe_message = update.message.reply_text.await_args.args[0]
         for internal_name in ("ReadTimeout", "GigaChat", "SDK", "httpx"):
@@ -161,19 +205,19 @@ class GigaChatProviderTests(unittest.TestCase):
         blocking = AsyncMock(side_effect=[ValueError("invalid JSON"), "safe answer"])
 
         with (
-            patch("bot.get_or_create_client", return_value=1),
-            patch("bot.save_message"),
-            patch("bot.pure_greeting_response", return_value=None),
-            patch("bot.get_history", return_value=[]),
-            patch("bot.get_client_active_case", return_value=None),
-            patch("bot.plan_response", return_value=response_plan),
-            patch("bot.select_answer_source", return_value="model"),
-            patch("bot.route_with_conversation_policy", return_value=routing),
-            patch("bot.apply_case_continuity", return_value=routing),
-            patch("bot.should_use_conversation_flow", return_value=False),
-            patch("bot.run_blocking", new=blocking),
-            patch("bot.guard_policy_answer", side_effect=lambda text, plan: text),
-            patch("bot.guard_client_voice", side_effect=lambda text, message: text),
+            patch("client_handler.get_or_create_client", return_value=1),
+            patch("client_handler.save_message"),
+            patch("client_handler.pure_greeting_response", return_value=None),
+            patch("client_handler.get_history", return_value=[]),
+            patch("client_handler.get_client_active_case", return_value=None),
+            patch("client_handler.plan_response", return_value=response_plan),
+            patch("client_handler.select_answer_source", return_value="model"),
+            patch("client_handler.route_with_conversation_policy", return_value=routing),
+            patch("client_handler.apply_case_continuity", return_value=routing),
+            patch("client_handler.should_use_conversation_flow", return_value=False),
+            patch("client_handler.run_blocking", new=blocking),
+            patch("client_handler.guard_policy_answer", side_effect=lambda text, plan: text),
+            patch("client_handler.guard_client_voice", side_effect=lambda text, message: text),
         ):
             asyncio.run(bot.handle_message(update, SimpleNamespace()))
 
@@ -202,17 +246,17 @@ class GigaChatProviderTests(unittest.TestCase):
         )
 
         with (
-            patch("bot.get_or_create_client", return_value=1),
-            patch("bot.save_message"),
+            patch("client_handler.get_or_create_client", return_value=1),
+            patch("client_handler.save_message"),
             patch(
-                "bot.get_history",
+                "client_handler.get_history",
                 return_value=[{"role": "user", "content": message}],
             ),
-            patch("bot.get_client_active_case", return_value=active_case),
-            patch("bot.format_case_for_ai", return_value="existing housing case"),
-            patch("bot.persist_case_analysis") as persist_case,
-            patch("bot.execute_housing_search", new=AsyncMock()) as search,
-            patch("bot.ask_gigachat") as generation,
+            patch("client_handler.get_client_active_case", return_value=active_case),
+            patch("client_handler.format_case_for_ai", return_value="existing housing case"),
+            patch("client_handler.persist_case_analysis") as persist_case,
+            patch("client_handler.execute_housing_search", new=AsyncMock()) as search,
+            patch("client_handler.ask_gigachat") as generation,
         ):
             asyncio.run(bot.handle_message(update, SimpleNamespace()))
 
@@ -223,8 +267,8 @@ class GigaChatProviderTests(unittest.TestCase):
         answer = update.message.reply_text.await_args.args[0]
         self.assertIn("concierge-компаньон", answer)
 
-    @patch("bot.get_access_token", return_value="token")
-    @patch("bot.generate_text")
+    @patch("client_ai.get_access_token", return_value="token")
+    @patch("client_ai.generate_text")
     def test_successful_analyze_case_flow_is_unchanged(self, generation, _token):
         generation.return_value = (
             '{"category":"housing","title":"Поиск жилья","data":{},'
@@ -241,8 +285,8 @@ class GigaChatProviderTests(unittest.TestCase):
         self.assertEqual(generation.call_args.kwargs["stage"], "analyze_case")
         self.assertEqual(generation.call_args.kwargs["correlation_id"], 321)
 
-    @patch("bot.get_access_token", return_value="token")
-    @patch("bot.generate_text", return_value="Нормальный ответ")
+    @patch("client_ai.get_access_token", return_value="token")
+    @patch("client_ai.generate_text", return_value="Нормальный ответ")
     def test_normal_conversation_generation_is_unchanged(self, generation, _token):
         result = bot.ask_gigachat(
             [{"role": "user", "content": "Добрый день"}],

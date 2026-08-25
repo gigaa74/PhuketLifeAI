@@ -66,6 +66,33 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             load_settings({**base, "GIGACHAT_TIMEOUT_SECONDS": "0"})
 
+    def test_reliability_controls_have_safe_defaults_and_validate(self):
+        base = {
+            "TELEGRAM_BOT_TOKEN": "telegram-secret",
+            "GIGACHAT_API_KEY": "gigachat-secret",
+            "YANDEX_SEARCH_API_KEY": "yandex-secret",
+            "YANDEX_FOLDER_ID": "folder-id",
+        }
+        settings = load_settings(base)
+        self.assertEqual(settings.client_rate_limit_requests, 10)
+        self.assertEqual(settings.client_rate_limit_window_seconds, 60.0)
+        self.assertEqual(settings.external_retry_attempts, 3)
+        self.assertEqual(settings.external_retry_base_delay_seconds, 0.5)
+
+        configured = load_settings({
+            **base,
+            "CLIENT_RATE_LIMIT_REQUESTS": "4",
+            "CLIENT_RATE_LIMIT_WINDOW_SECONDS": "15",
+            "EXTERNAL_RETRY_ATTEMPTS": "2",
+            "EXTERNAL_RETRY_BASE_DELAY_SECONDS": "0.1",
+        })
+        self.assertEqual(configured.client_rate_limit_requests, 4)
+        self.assertEqual(configured.external_retry_attempts, 2)
+        with self.assertRaises(ConfigurationError):
+            load_settings({**base, "EXTERNAL_RETRY_ATTEMPTS": "0"})
+        with self.assertRaises(ConfigurationError):
+            load_settings({**base, "EXTERNAL_RETRY_ATTEMPTS": "6"})
+
 
 if __name__ == "__main__":
     unittest.main()

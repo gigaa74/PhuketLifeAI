@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from database import get_connection
 from scout_detector import CATEGORY_PATTERNS, CLIENT_INTENT, PARTNER_INTENT
 from scout_labels import category_label_ru
+from reliability import safe_log
 
 
 LEAD_TYPES = {"client", "partner", "unclear"}
@@ -599,7 +600,7 @@ def build_analysis(text, *, username=None, source=None, generator=None,
             ):
                 draft = generated.strip()
         except Exception as error:
-            print("[MANUAL_LEAD] Draft fallback: " + type(error).__name__)
+            safe_log("manual_lead_draft_fallback", level="warning", error=error)
     return {
         **result,
         "extracted": details,

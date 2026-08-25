@@ -5,9 +5,11 @@ DB_NAME = "phuketlife.db"
 
 
 def get_connection(db_path=None):
-    connection = sqlite3.connect(db_path or DB_NAME)
+    connection = sqlite3.connect(db_path or DB_NAME, timeout=5)
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA synchronous = NORMAL")
     return connection
 
 
