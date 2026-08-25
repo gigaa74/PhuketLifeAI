@@ -25,6 +25,7 @@ from manual_leads import (
     redact_personal_data,
     update_manual_lead,
 )
+from service_catalog import SERVICE_CATEGORIES
 
 
 class ManualLeadCoreTests(unittest.TestCase):
@@ -92,6 +93,61 @@ class ManualLeadCoreTests(unittest.TestCase):
         self.assertIn("Категория: лодки и яхты", card)
         self.assertIn("— маршрут / направление: остров Khao Phing Kan", card)
         self.assertNotIn("жиль", card.casefold())
+
+    def test_broad_service_catalog_classifies_common_phuket_requests(self):
+        examples = {
+            "Нужен персональный тренер на Пхукете": "fitness_trainer",
+            "Ищу личного водителя на месяц": "personal_driver",
+            "Нужна домохозяйка в Банг Тао": "housekeeping",
+            "Ищу няню для двух детей": "nanny",
+            "Нужна уборщица завтра в Кароне": "cleaning",
+            "Нужен электрик срочно в Раваи": "electrician",
+            "Ищу ветеринара для собаки": "pets",
+            "Нужен переводчик с русского на тайский": "translation",
+            "Ищу фотографа на свадьбу": "photo_video",
+            "Нужен личный повар на виллу": "private_chef",
+            "Нужен сантехник срочно в Чалонге": "plumber",
+            "Ищу репетитора по английскому": "tutoring",
+        }
+        for text, expected in examples.items():
+            with self.subTest(text=text):
+                result = build_analysis(text)
+                self.assertEqual(result["classification"], "client")
+                self.assertIn(expected, result["categories"])
+                self.assertNotIn("housing", result["categories"])
+                self.assertNotIn("жиль", result["draft"].casefold())
+
+    def test_category_specific_questions_replace_generic_housing_form(self):
+        trainer = build_analysis("Нужен персональный тренер на Пхукете")
+        nanny = build_analysis("Ищу няню для двух детей")
+        driver = build_analysis("Ищу личного водителя на месяц")
+        self.assertIn("цель тренировок", trainer["missing"])
+        self.assertIn("какая у Вас цель тренировок", trainer["draft"])
+        self.assertEqual(nanny["extracted"]["children_count"], 2)
+        self.assertNotIn("количество детей", nanny["missing"])
+        self.assertIn("возраст детей", nanny["missing"])
+        self.assertIn("какой график требуется", nanny["draft"])
+        self.assertIn("предполагаемые маршруты", driver["missing"])
+        self.assertNotIn("количество гостей", driver["missing"])
+
+    def test_unknown_service_never_falls_back_to_housing(self):
+        result = build_analysis(
+            "Нужен специалист по необычной услуге",
+            forced_classification="client",
+        )
+        self.assertEqual(result["categories"], [])
+        self.assertEqual(result["missing"], ["какая именно услуга нужна"])
+        self.assertIn("помощь с указанной услугой", result["draft"])
+        self.assertNotIn("жиль", result["draft"].casefold())
+        self.assertIsNone(result["partner_request_draft"])
+
+    def test_new_categories_are_valid_partner_service_keys(self):
+        expected = {
+            "fitness_trainer", "personal_driver", "housekeeping", "nanny",
+            "cleaning", "private_chef", "electrician", "plumber", "pets",
+            "translation", "tutoring", "security", "accounting_business",
+        }
+        self.assertTrue(expected.issubset(SERVICE_CATEGORIES))
 
     def test_external_ai_prompt_redacts_direct_identifiers(self):
         raw = (
@@ -386,6 +442,19 @@ class ManualLeadCoreTests(unittest.TestCase):
         )
         self.assertNotEqual(result["draft"], generated)
         self.assertNotIn("Какой бюджет", result["draft"])
+
+    def test_llm_draft_repeating_known_new_service_fact_is_replaced(self):
+        generated = (
+            "Здравствуйте! Мы — Phuket Life, сервис персонального сопровождения "
+            "на Пхукете. Какой график Вам нужен? Готовы взять Ваш запрос в работу. "
+            "После ответа проверим варианты у профильных партнёров."
+        )
+        result = build_analysis(
+            "Ищу домработницу по будням в Банг Тао",
+            generator=lambda prompt: generated,
+        )
+        self.assertNotEqual(result["draft"], generated)
+        self.assertNotIn("Какой график Вам нужен", result["draft"])
 
     def test_deduplication_by_source_and_hash(self):
         analysis = build_analysis("Нужна аренда автомобиля")

@@ -1,3 +1,6 @@
+from service_catalog import SERVICE_CATEGORY_ADMIN_RU
+
+
 CASE_STATUS_RU = {
     "new": "Новый",
     "active": "Собираются данные",
@@ -39,15 +42,7 @@ PARTNER_REQUEST_STATUS_RU = {
     "cancelled": "Отменён",
 }
 
-SERVICE_CATEGORY_RU = {
-    "housing": "Жильё", "transfer": "Трансфер",
-    "car_rental": "Аренда автомобиля", "bike_rental": "Аренда байка",
-    "excursions": "Экскурсии", "boats": "Катера", "fishing": "Рыбалка",
-    "visa": "Визы", "sim": "SIM-карты", "activities": "Активности",
-    "medical": "Медицина", "beauty": "Красота", "food": "Питание",
-    "delivery": "Доставка", "guide": "Гид",
-    "photo_video": "Фото и видео", "other": "Другое",
-}
+SERVICE_CATEGORY_RU = SERVICE_CATEGORY_ADMIN_RU
 
 VALIDATION_REASON_RU = {
     "global_review_mode": "Включён режим обязательной ручной проверки",

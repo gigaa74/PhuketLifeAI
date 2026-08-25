@@ -11,15 +11,11 @@ from partner_authority import (
     get_approved_terms,
     list_pending_proposals,
 )
+from service_catalog import CATEGORY_LABELS_RU, SERVICE_CATEGORIES
 
 
 PARTNER_STATUSES = {"candidate", "active", "paused", "blocked"}
 PARTNER_TYPES = {"service_provider", "b2b_channel", "hybrid"}
-SERVICE_CATEGORIES = {
-    "housing", "transfer", "car_rental", "bike_rental", "excursions",
-    "boats", "fishing", "visa", "sim", "activities", "medical",
-    "beauty", "food", "delivery", "guide", "photo_video", "other",
-}
 REQUEST_STATUSES = {
     "created", "sent", "responded", "declined", "failed", "cancelled"
 }
@@ -27,13 +23,7 @@ DECLINE_PHRASES = (
     "нет вариантов", "вариантов нет", "не могу помочь", "не смогу помочь",
     "ничего нет", "нет предложений",
 )
-CATEGORY_LABELS = {
-    "housing": "жильё",
-    "transfer": "трансфер",
-    "car_rental": "аренда автомобиля",
-    "bike_rental": "аренда байка",
-    "excursions": "экскурсии",
-}
+CATEGORY_LABELS = CATEGORY_LABELS_RU
 
 
 class PartnerNetworkError(RuntimeError):

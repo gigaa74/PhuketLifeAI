@@ -1,25 +1,7 @@
 import re
 
+from service_catalog import detect_service_categories
 from service_labels import category_label_ru
-
-
-CATEGORY_PATTERNS = {
-    "housing": r"\b(?:квартир\w*|апартамент\w*|вилл\w*|жиль[её]|дом\w*)\b",
-    "car_rental": r"\b(?:автомобил\w*|машин\w*|авто\b)",
-    "bike_rental": r"\b(?:байк\w*|мотоцикл\w*|скутер\w*)\b",
-    "transfer": r"\b(?:трансфер\w*|такси\b|водител\w*)\b",
-    "excursions": r"\b(?:экскурси\w*|тур\w*|гид\w*)\b",
-    "boats": (
-        r"\b(?:лодк\w*|яхт\w*|катер\w*|судн\w*|корабл\w*|"
-        r"спидбот\w*|speed\s*boats?)\b"
-    ),
-    "fishing": r"\b(?:рыбалк\w*|рыболов\w*)\b",
-    "food": r"\b(?:ресторан\w*|кафе\b|доставк\w+ еды)\b",
-    "wellness": r"\b(?:wellness|спа\b|массаж\w*|йог\w*)\b",
-    "medical": r"\b(?:клиник\w*|врач\w*|медицин\w*|стоматолог\w*)\b",
-    "legal_visa": r"\b(?:юрист\w*|виз\w*|адвокат\w*|легализаци\w*)\b",
-    "relocation": r"\b(?:relocation|релокаци\w*|переезд\w*)\b",
-}
 
 PARTNER_INTENT = re.compile(
     r"\b(?:сдаю|сдаём|предлагаю|предлагаем|оказываю|оказываем|"
@@ -38,10 +20,7 @@ def classify_lead_message(lead_type, text):
     value = " ".join(str(text or "").split())
     if len(value) < 12:
         return None
-    categories = [
-        category for category, pattern in CATEGORY_PATTERNS.items()
-        if re.search(pattern, value, re.I)
-    ]
+    categories = detect_service_categories(value)
     intent = PARTNER_INTENT.search(value) if lead_type == "partner" else CLIENT_INTENT.search(value)
     if not categories or not intent:
         return None

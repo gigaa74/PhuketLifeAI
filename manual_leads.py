@@ -5,7 +5,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from database import get_connection
-from lead_classifier import CATEGORY_PATTERNS, CLIENT_INTENT, PARTNER_INTENT
+from lead_classifier import CLIENT_INTENT, PARTNER_INTENT
+from service_catalog import detect_service_categories
 from service_labels import category_label_ru
 from reliability import safe_log
 
@@ -71,6 +72,58 @@ SEA_DESTINATION_ALIASES = {
     "острова Кхай": ("острова кхай", "khai islands", "koh khai"),
     "остров Майтон": ("майтон", "maithon", "maiton"),
     "залив Пханг Нга": ("пханг нга", "phang nga"),
+}
+
+# Missing-data rules are category-specific. They intentionally describe the minimum
+# needed for a useful next step, not an exhaustive questionnaire.
+CLIENT_REQUIRED_FIELDS = {
+    "housing": (("dates_or_duration", "даты или срок"), ("budget", "бюджет"), ("people", "количество гостей"), ("areas", "предпочтительный район")),
+    "property_purchase": (("budget", "бюджет"), ("areas", "предпочтительный район"), ("requirements", "требования к объекту")),
+    "property_management": (("areas", "район объекта"), ("property_details", "тип и параметры объекта"), ("service_scope", "какие задачи нужно передать в управление")),
+    "car_rental": (("dates_or_duration", "даты или срок"), ("budget", "бюджет"), ("areas", "район получения"), ("requirements", "требования к автомобилю")),
+    "bike_rental": (("dates_or_duration", "даты или срок"), ("budget", "бюджет"), ("areas", "район получения"), ("requirements", "требования к байку")),
+    "transfer": (("dates_or_duration", "дата и время поездки"), ("route", "маршрут поездки"), ("people", "количество пассажиров")),
+    "personal_driver": (("schedule", "график работы водителя"), ("areas", "район подачи"), ("route", "предполагаемые маршруты"), ("budget", "бюджет")),
+    "excursions": (("dates_or_duration", "желаемые даты"), ("people", "количество участников"), ("interests", "какие экскурсии интересуют"), ("budget", "бюджет")),
+    "boats": (("dates_or_duration", "даты или срок"), ("destination", "маршрут или направление"), ("people", "количество гостей"), ("budget", "бюджет")),
+    "fishing": (("dates_or_duration", "желаемая дата"), ("people", "количество участников"), ("experience_level", "опыт и желаемый формат рыбалки"), ("budget", "бюджет")),
+    "diving": (("dates_or_duration", "желаемая дата"), ("people", "количество участников"), ("experience_level", "опыт и наличие сертификатов"), ("budget", "бюджет")),
+    "water_sports": (("dates_or_duration", "желаемая дата"), ("people", "количество участников"), ("experience_level", "уровень подготовки"), ("budget", "бюджет")),
+    "activities": (("dates_or_duration", "желаемая дата"), ("people", "количество участников"), ("interests", "какие активности интересуют"), ("budget", "бюджет")),
+    "guide": (("dates_or_duration", "дата и продолжительность"), ("areas", "маршрут или район"), ("language", "язык сопровождения"), ("people", "количество участников")),
+    "cleaning": (("dates_or_duration", "дата и удобное время"), ("areas", "район"), ("property_details", "тип и размер объекта"), ("service_scope", "объём уборки")),
+    "housekeeping": (("schedule", "график работы"), ("areas", "район"), ("duties", "перечень обязанностей"), ("budget", "бюджет или зарплата")),
+    "nanny": (("schedule", "график работы"), ("areas", "район"), ("children_count", "количество детей"), ("children_ages", "возраст детей"), ("language", "требования к языку"), ("budget", "бюджет или зарплата")),
+    "personal_assistant": (("schedule", "график работы"), ("areas", "район"), ("duties", "перечень задач"), ("language", "требования к языку"), ("budget", "бюджет или зарплата")),
+    "private_chef": (("dates_or_duration", "дата или график"), ("areas", "район"), ("people", "количество человек"), ("food_preferences", "кухня, меню и ограничения"), ("budget", "бюджет")),
+    "repair": (("areas", "район"), ("problem", "что сломалось или что нужно сделать"), ("urgency", "срочность")),
+    "electrician": (("areas", "район"), ("problem", "описание неисправности"), ("urgency", "срочность")),
+    "plumber": (("areas", "район"), ("problem", "описание неисправности"), ("urgency", "срочность")),
+    "aircon_service": (("areas", "район"), ("problem", "неисправность или вид обслуживания"), ("equipment_count", "количество кондиционеров"), ("urgency", "срочность")),
+    "pool_garden": (("areas", "район"), ("property_details", "параметры объекта"), ("schedule", "разовая работа или регулярный график")),
+    "fitness_trainer": (("goals", "цель тренировок"), ("schedule", "удобный график"), ("areas", "район или место тренировок"), ("experience_level", "уровень подготовки"), ("budget", "бюджет")),
+    "wellness": (("dates_or_duration", "дата или период"), ("areas", "район"), ("people", "количество участников"), ("interests", "желаемый формат")),
+    "massage": (("dates_or_duration", "дата и время"), ("areas", "район"), ("people", "количество человек"), ("service_scope", "вид массажа")),
+    "beauty": (("dates_or_duration", "дата и время"), ("areas", "район"), ("service_scope", "какая процедура нужна"), ("budget", "бюджет")),
+    "medical": (("medical_need", "какой специалист или помощь нужны"), ("urgency", "срочность"), ("areas", "предпочтительный район"), ("language", "язык общения")),
+    "dental": (("medical_need", "какая стоматологическая помощь нужна"), ("urgency", "срочность"), ("areas", "предпочтительный район")),
+    "insurance": (("service_scope", "что требуется застраховать"), ("people", "количество застрахованных"), ("dates_or_duration", "срок страхования"), ("budget", "бюджет")),
+    "pets": (("animal_details", "вид, размер и особенности животного"), ("service_scope", "какая услуга нужна"), ("dates_or_duration", "дата или период"), ("areas", "район")),
+    "food": (("areas", "район"), ("food_preferences", "кухня и предпочтения"), ("people", "количество человек"), ("budget", "бюджет")),
+    "catering": (("dates_or_duration", "дата и время"), ("areas", "место проведения"), ("people", "количество гостей"), ("food_preferences", "меню и ограничения"), ("budget", "бюджет")),
+    "delivery": (("route", "откуда и куда доставить"), ("dates_or_duration", "дата и время"), ("item_details", "что нужно доставить")),
+    "shopping": (("item_details", "что именно нужно найти или купить"), ("areas", "район доставки"), ("budget", "бюджет")),
+    "tutoring": (("subject", "предмет или навык"), ("student_details", "возраст и уровень ученика"), ("schedule", "удобный график"), ("language", "язык занятий"), ("budget", "бюджет")),
+    "translation": (("languages", "языковая пара"), ("service_scope", "устный или письменный перевод"), ("dates_or_duration", "дата или срок"), ("budget", "бюджет")),
+    "photo_video": (("dates_or_duration", "дата и продолжительность"), ("areas", "локация"), ("event_type", "формат съёмки"), ("budget", "бюджет")),
+    "events": (("event_type", "тип мероприятия"), ("dates_or_duration", "дата"), ("areas", "место"), ("people", "количество гостей"), ("budget", "бюджет")),
+    "visa": (("citizenship", "гражданство"), ("current_status", "текущий визовый статус"), ("service_scope", "какой результат нужен"), ("deadline", "срок")),
+    "legal": (("service_scope", "суть юридического вопроса"), ("deadline", "срочность или срок"), ("language", "язык консультации")),
+    "legal_visa": (("service_scope", "суть визового или юридического вопроса"), ("deadline", "срок")),
+    "accounting_business": (("service_scope", "какая услуга нужна"), ("business_details", "тип компании или бизнеса"), ("deadline", "срок")),
+    "relocation": (("dates_or_duration", "дата переезда"), ("people", "кто переезжает"), ("service_scope", "какая помощь нужна"), ("budget", "бюджет")),
+    "sim": (("service_scope", "SIM-карта или домашний интернет"), ("areas", "район"), ("dates_or_duration", "срок использования")),
+    "security": (("dates_or_duration", "дата или график"), ("areas", "место"), ("service_scope", "задачи охраны"), ("people", "необходимое количество сотрудников")),
 }
 
 
@@ -179,10 +232,7 @@ def _external_ai_details(details):
 
 def classify_manual_lead(text):
     value = " ".join(str(text or "").split())
-    categories = [
-        key for key, pattern in CATEGORY_PATTERNS.items()
-        if re.search(pattern, value, re.I)
-    ]
+    categories = detect_service_categories(value)
     client = bool(CLIENT_INTENT.search(value))
     partner = bool(PARTNER_INTENT.search(value))
     if categories and client and not partner:
@@ -289,6 +339,94 @@ def extract_lead_details(text, *, username=None, source=None):
             requirements.append(found.group(0))
     if requirements:
         details["requirements"] = requirements
+    route = re.search(
+        r"\b(?:из|от)\s+([^,.;]{2,45}?)\s+(?:в|до)\s+([^,.;]{2,45})(?=$|[,.;])",
+        value, re.I,
+    )
+    if route:
+        details["route"] = f"из {route.group(1).strip()} в {route.group(2).strip()}"
+    schedule = re.search(
+        r"\b(?:ежедневно|по будням|по выходным|раз в неделю|\d+\s+раза? в неделю|"
+        r"с\s+\d{1,2}(?::\d{2})?\s+до\s+\d{1,2}(?::\d{2})?|"
+        r"на постоянн\w+ основ\w*|полный день|неполный день)\b",
+        value, re.I,
+    )
+    if schedule:
+        details["schedule"] = schedule.group(0)
+    language_values = []
+    for language, pattern in (
+        ("русский", r"\bрусск\w*\b"), ("английский", r"\bанглийск\w*\b"),
+        ("тайский", r"\bтайск\w*\b"), ("китайский", r"\bкитайск\w*\b"),
+    ):
+        if re.search(pattern, value, re.I):
+            language_values.append(language)
+    if language_values:
+        details["language"] = language_values
+    child_ages = re.findall(
+        r"\b(?:реб[её]н(?:ок|ка)|дет(?:и|ей))[^.;]{0,20}?\b(\d{1,2})\s*лет",
+        value, re.I,
+    )
+    child_count = re.search(
+        r"\b(\d+|один|одна|одного|одной|двое|двух|трое|троих|"
+        r"четверо|четыр[её]х)\s+(?:дет\w*|реб[её]нк\w*)\b",
+        value, re.I,
+    )
+    if child_count:
+        count_words = {
+            "один": 1, "одна": 1, "одного": 1, "одной": 1,
+            "двое": 2, "двух": 2, "трое": 3, "троих": 3,
+            "четверо": 4, "четырех": 4, "четырёх": 4,
+        }
+        raw_count = child_count.group(1).casefold()
+        details["children_count"] = int(raw_count) if raw_count.isdigit() else count_words[raw_count]
+    if child_ages:
+        details["children_ages"] = [int(age) for age in child_ages]
+    goal = re.search(
+        r"\b(?:похудеть|сбросить вес|набрать масс\w*|подтянуть форм\w*|"
+        r"реабилитаци\w*|подготовк\w+ к соревнован\w*|научиться плавать|"
+        r"улучшить выносливост\w*)\b", value, re.I,
+    )
+    if goal:
+        details["goals"] = goal.group(0)
+    experience = re.search(
+        r"\b(?:новичок|начинающ\w*|без опыта|средн\w+ уров\w*|опытн\w*|"
+        r"сертификат\w+ (?:padi|дайвер\w*))\b", value, re.I,
+    )
+    if experience:
+        details["experience_level"] = experience.group(0)
+    property_details = re.search(
+        r"\b(?:квартир\w*|апартамент\w*|вилл\w*|дом\w*|таунхаус\w*)"
+        r"(?:[^.;]{0,45}(?:\d+\s*(?:м²|кв\.?\s*м)|\d+\s*спальн\w*))?",
+        value, re.I,
+    )
+    if property_details:
+        details["property_details"] = property_details.group(0).strip()
+    if re.search(r"\b(?:разов\w*|генеральн\w*|поддерживающ\w*)\s+уборк\w*\b", value, re.I):
+        details["service_scope"] = re.search(
+            r"\b(?:разов\w*|генеральн\w*|поддерживающ\w*)\s+уборк\w*\b", value, re.I
+        ).group(0)
+    duties = re.search(r"\b(?:обязанност\w*|задач\w*)\s*[:—-]\s*([^.;]{3,180})", value, re.I)
+    if duties:
+        details["duties"] = duties.group(1).strip()
+    food = re.search(
+        r"\b(?:тайск\w+|русск\w+|европейск\w+|итальянск\w+|веганск\w+|"
+        r"вегетарианск\w+|халяль\w*|без глютен\w*)\s+(?:кухн\w*|меню|еда)",
+        value, re.I,
+    )
+    if food:
+        details["food_preferences"] = food.group(0)
+    animal = re.search(r"\b(?:собак\w*|кошк\w*|кот\w*|щенк\w*|питомц\w*)[^.;]{0,50}", value, re.I)
+    if animal:
+        details["animal_details"] = animal.group(0).strip()
+    equipment = re.search(r"\b(\d+)\s+кондиционер\w*\b", value, re.I)
+    if equipment:
+        details["equipment_count"] = int(equipment.group(1))
+    citizenship = re.search(r"\bграждан(?:ство|ин)\s*[:—-]?\s*([А-ЯA-Zа-яa-z-]{3,30})", value, re.I)
+    if citizenship:
+        details["citizenship"] = citizenship.group(1)
+    deadline = re.search(r"\b(?:до\s+\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|срочно|в течение \d+\s+дн\w*)\b", value, re.I)
+    if deadline:
+        details["deadline"] = deadline.group(0)
     explicit_username = re.search(r"(?<!\w)@([A-Za-z0-9_]{5,32})\b", value)
     phone = re.search(r"(?<!\d)(\+?\d[\d ()-]{7,}\d)(?!\d)", value)
     messenger = re.search(
@@ -335,20 +473,17 @@ def missing_critical_data(classification, categories, details):
     if not categories:
         missing.append("какая именно услуга нужна" if classification == "client" else "какие услуги предлагаются")
     if classification == "client":
-        required = [
-            ("dates_or_duration", "даты или срок"),
-            ("budget", "бюджет"),
-            ("people", "количество гостей"),
-        ]
-        if "housing" in categories or {"car_rental", "bike_rental"}.intersection(categories):
-            required.append(("areas", "предпочтительный район"))
-        if "transfer" in categories:
-            required.append(("route", "маршрут поездки"))
-        if {"boats", "fishing"}.intersection(categories):
-            required.append(("destination", "маршрут или направление"))
+        required = []
+        for category in categories:
+            required.extend(CLIENT_REQUIRED_FIELDS.get(category, ()))
+        # Unknown categories get one safe clarification instead of housing defaults.
+        if not categories:
+            required = []
+        seen = set()
         for key, label in required:
-            if key not in details:
+            if key not in details and key not in seen:
                 missing.append(label)
+            seen.add(key)
     else:
         for key, label in (
             ("work_geography", "география работы"),
@@ -416,7 +551,7 @@ def _human_dates(value):
 
 
 def _client_request_sentence(categories, details):
-    subject = "жильё"
+    subject = "помощь с указанной услугой"
     if "housing" in categories:
         subject = "виллу" if "вилл" in details.get("original_hint", "") else "жильё"
     elif "boats" in categories:
@@ -429,7 +564,31 @@ def _client_request_sentence(categories, details):
             else "судно"
         )
     elif categories:
-        subject = _service_summary(categories)
+        natural_subjects = {
+            "personal_driver": "личного водителя",
+            "fitness_trainer": "персонального тренера",
+            "housekeeping": "помощницу по дому",
+            "nanny": "няню",
+            "cleaning": "уборку",
+            "personal_assistant": "личного помощника",
+            "private_chef": "личного повара",
+            "electrician": "электрика",
+            "plumber": "сантехника",
+            "repair": "мастера для ремонта",
+            "aircon_service": "мастера по кондиционерам",
+            "massage": "массажиста",
+            "medical": "медицинскую помощь",
+            "dental": "стоматолога",
+            "pets": "специалиста для животного",
+            "translation": "переводчика",
+            "photo_video": "фотографа или видеографа",
+            "tutoring": "репетитора",
+            "security": "охрану",
+        }
+        if len(categories) == 1 and categories[0] in natural_subjects:
+            subject = natural_subjects[categories[0]]
+        else:
+            subject = "помощь по направлению «" + _service_summary(categories) + "»"
     parts = [f"Вы ищете {subject}"]
     if details.get("destination"):
         parts.append("для поездки на " + details["destination"])
@@ -464,6 +623,30 @@ def _natural_client_questions(missing, details):
             questions.append("какой маршрут или направление Вы рассматриваете")
         elif field == "маршрут поездки":
             questions.append("откуда и куда нужна поездка")
+        elif field in ("район", "район объекта", "район получения", "район подачи", "район доставки", "предпочтительный район"):
+            questions.append("в каком районе нужна услуга")
+        elif field in ("дата и удобное время", "дата и время", "желаемая дата", "желаемые даты", "дата и время поездки", "дата и продолжительность", "дата или период", "дата или график", "дата"):
+            questions.append("на какую дату и время нужна услуга")
+        elif field in ("количество пассажиров", "количество участников", "количество человек", "количество застрахованных"):
+            questions.append("для скольких человек нужна услуга")
+        elif field in ("график работы", "график работы водителя", "удобный график"):
+            questions.append("какой график требуется")
+        elif field == "цель тренировок":
+            questions.append("какая у Вас цель тренировок")
+        elif field in ("уровень подготовки", "опыт и наличие сертификатов", "опыт и желаемый формат рыбалки"):
+            questions.append("какой у Вас уровень подготовки или опыт")
+        elif field == "количество детей":
+            questions.append("сколько детей")
+        elif field == "возраст детей":
+            questions.append("какого возраста дети")
+        elif field in ("требования к языку", "язык общения", "язык сопровождения", "язык консультации", "язык занятий"):
+            questions.append("на каком языке нужно общение")
+        elif field in ("перечень обязанностей", "перечень задач"):
+            questions.append("какие обязанности или задачи нужно выполнять")
+        elif field in ("что сломалось или что нужно сделать", "описание неисправности", "неисправность или вид обслуживания"):
+            questions.append("что именно произошло и какая помощь требуется")
+        elif field == "срочность":
+            questions.append("насколько срочно нужна помощь")
         else:
             questions.append(field)
     if not questions:
@@ -485,6 +668,18 @@ def _partner_service_phrase(categories):
         "medical": "медицинские услуги",
         "legal_visa": "юридические и визовые услуги",
         "relocation": "помощь с переездом и релокацией",
+        "personal_driver": "услуги личного водителя",
+        "cleaning": "услуги уборки",
+        "housekeeping": "услуги помощницы по дому",
+        "nanny": "услуги няни",
+        "personal_assistant": "услуги личного помощника",
+        "private_chef": "услуги личного повара",
+        "fitness_trainer": "услуги персонального тренера",
+        "electrician": "услуги электрика",
+        "plumber": "услуги сантехника",
+        "massage": "массаж",
+        "translation": "услуги переводчика",
+        "photo_video": "фото- и видеосъёмку",
     }
     labels = [accusative.get(item, category_label_ru(item)) for item in categories]
     if len(labels) <= 1:
@@ -581,6 +776,22 @@ def deterministic_partner_request(categories, details, missing):
         lines.append("— маршрут / направление: " + details["destination"])
     if details.get("route"):
         lines.append("— маршрут: " + details["route"])
+    extra_labels = {
+        "schedule": "график", "children_count": "количество детей",
+        "children_ages": "возраст детей",
+        "language": "язык", "goals": "цель", "experience_level": "опыт",
+        "property_details": "объект", "service_scope": "объём услуги",
+        "duties": "обязанности", "food_preferences": "предпочтения",
+        "animal_details": "животное", "equipment_count": "количество оборудования",
+        "citizenship": "гражданство", "deadline": "срок",
+    }
+    for key, label in extra_labels.items():
+        if key not in details:
+            continue
+        value = details[key]
+        if isinstance(value, list):
+            value = ", ".join(str(item) for item in value)
+        lines.append(f"— {label}: {value}")
     requirements = details.get("requirements") or []
     if requirements:
         lines.append("— требования: " + "; ".join(requirements))
@@ -652,6 +863,23 @@ def _generated_draft_is_safe(value, classification, missing, details):
         "offer_source": ("источник предложений", "откуда вы получаете", "источник цен"),
         "work_geography": ("география работы", "в каких районах", "где вы работаете"),
         "delivery_model": ("по какой схеме", "схема взаимодействия", "как вы работаете"),
+        "route": ("какой маршрут", "откуда и куда", "уточните маршрут"),
+        "destination": ("какое направление", "какой остров", "уточните направление"),
+        "schedule": ("какой график", "уточните график", "удобный график"),
+        "children_count": ("сколько детей", "количество детей"),
+        "children_ages": ("возраст детей", "какого возраста"),
+        "language": ("какой язык", "на каком языке", "требования к языку"),
+        "goals": ("цель тренировок", "какая цель"),
+        "experience_level": ("уровень подготовки", "какой опыт", "наличие сертификат"),
+        "property_details": ("какой объект", "тип объекта", "размер объекта"),
+        "service_scope": ("какая услуга", "объём услуги", "какая процедура"),
+        "duties": ("какие обязанности", "перечень задач"),
+        "food_preferences": ("какая кухня", "предпочтения по питанию", "ограничения в питании"),
+        "animal_details": ("какое животное", "вид животного", "размер животного"),
+        "equipment_count": ("сколько кондиционеров", "количество кондиционеров"),
+        "citizenship": ("какое гражданство", "уточните гражданство"),
+        "deadline": ("какой срок", "какой дедлайн", "насколько срочно"),
+        "requirements": ("какие требования", "требования к объекту", "требования к автомобилю"),
     }
     if any(
         key in details and any(marker in lowered for marker in markers)

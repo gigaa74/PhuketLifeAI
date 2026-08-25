@@ -1190,6 +1190,12 @@ def _manual_lead_recommendation(lead):
     compatible_categories = set(categories)
     if categories.intersection({"boats", "fishing"}):
         compatible_categories.add("excursions")
+    if categories.intersection({"cleaning", "housekeeping"}):
+        compatible_categories.update({"cleaning", "housekeeping"})
+    if categories.intersection({"medical", "dental"}):
+        compatible_categories.update({"medical", "dental"})
+    if categories.intersection({"visa", "legal", "legal_visa"}):
+        compatible_categories.update({"visa", "legal", "legal_visa"})
     matches = [
         partner for partner in list_partners()
         if partner.get("status") == "active"
@@ -1224,6 +1230,20 @@ def _format_manual_lead(lead):
         "offer_source": "источник предложений и цен",
         "contact": "контакт",
         "delivery_model": "модель работы",
+        "schedule": "график",
+        "children_count": "количество детей",
+        "children_ages": "возраст детей",
+        "language": "язык",
+        "goals": "цель",
+        "experience_level": "опыт / уровень",
+        "property_details": "объект",
+        "service_scope": "объём услуги",
+        "duties": "обязанности",
+        "food_preferences": "предпочтения по питанию",
+        "animal_details": "животное",
+        "equipment_count": "количество оборудования",
+        "citizenship": "гражданство",
+        "deadline": "срок / дедлайн",
     }
     known_lines = []
     for key, label in presentation.items():
