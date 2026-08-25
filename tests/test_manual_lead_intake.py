@@ -48,6 +48,51 @@ class ManualLeadCoreTests(unittest.TestCase):
         self.assertEqual(unclear["classification"], "unclear")
         self.assertEqual(unclear["signal"], "требуется ручная проверка")
 
+    def test_live_marine_request_is_client_not_housing(self):
+        text = (
+            "Добрый вечер, ищем на завтра судно на 7 человек для путешествия "
+            "на остров Khao Phing Kan"
+        )
+        result = build_analysis(text, generator=None)
+        self.assertEqual(result["classification"], "client")
+        self.assertEqual(result["categories"], ["boats"])
+        self.assertEqual(result["extracted"]["people"], 7)
+        self.assertEqual(result["extracted"]["dates_or_duration"], "завтра")
+        self.assertEqual(
+            result["extracted"]["destination"], "остров Khao Phing Kan"
+        )
+        self.assertEqual(result["missing"], ["бюджет"])
+        self.assertIn("ищете судно", result["draft"])
+        self.assertIn("остров Khao Phing Kan", result["draft"])
+        self.assertNotIn("жиль", result["draft"].casefold())
+        self.assertNotIn("какая именно услуга", result["draft"].casefold())
+        request = result["partner_request_draft"]
+        self.assertIn("— услуга: лодки и яхты", request)
+        self.assertIn("— даты / срок: завтра", request)
+        self.assertIn("— количество гостей: 7", request)
+        self.assertIn("— маршрут / направление: остров Khao Phing Kan", request)
+
+        lead = {
+            "id": 99,
+            "classification": result["classification"],
+            "categories": result["categories"],
+            "original_text": text,
+            "generated_draft": result["draft"],
+            "source_metadata": {},
+            "extracted_data": {
+                "known": result["extracted"],
+                "missing": result["missing"],
+                "signal": result["signal"],
+                "reasons": result["reasons"],
+                "partner_request_draft": request,
+            },
+            "waiting_on": "owner",
+        }
+        card = bot._format_manual_lead(lead)
+        self.assertIn("Категория: лодки и яхты", card)
+        self.assertIn("— маршрут / направление: остров Khao Phing Kan", card)
+        self.assertNotIn("жиль", card.casefold())
+
     def test_external_ai_prompt_redacts_direct_identifiers(self):
         raw = (
             "Ищу квартиру. Телефон +7 999 123-45-67, test@example.com, "

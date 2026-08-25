@@ -59,6 +59,20 @@ AREA_LOCATIVE = {
     "Лагуна": "Лагуне", "Пхукет-таун": "Пхукет-тауне",
 }
 
+SEA_DESTINATION_ALIASES = {
+    "остров Khao Phing Kan": (
+        "khao phing kan", "ко тапу", "остров джеймса бонда",
+        "james bond island",
+    ),
+    "острова Пхи-Пхи": ("пхи пхи", "пхи-пхи", "phi phi"),
+    "Симиланские острова": ("симилан", "similan"),
+    "остров Рача": ("остров рача", "racha island", "koh racha"),
+    "Коралловый остров": ("коралловый остров", "coral island", "koh hey"),
+    "острова Кхай": ("острова кхай", "khai islands", "koh khai"),
+    "остров Майтон": ("майтон", "maithon", "maiton"),
+    "залив Пханг Нга": ("пханг нга", "phang nga"),
+}
+
 
 class ManualLeadError(RuntimeError):
     pass
@@ -212,6 +226,11 @@ def extract_lead_details(text, *, username=None, source=None):
             areas.append(canonical)
     if areas:
         details["areas"] = areas
+    for destination, aliases in SEA_DESTINATION_ALIASES.items():
+        if any(re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", value, re.I)
+               for alias in aliases):
+            details["destination"] = destination
+            break
     if re.search(r"\b(?:по\s+всему\s+(?:острову|пхукету)|весь\s+пхукет)\b", value, re.I):
         details["work_geography"] = "весь Пхукет"
     date_match = re.search(
@@ -254,6 +273,8 @@ def extract_lead_details(text, *, username=None, source=None):
     urgency = re.search(r"\b(срочно|сегодня|завтра|как можно скорее)\b", value, re.I)
     if urgency:
         details["urgency"] = urgency.group(1)
+        if urgency.group(1).casefold() in ("сегодня", "завтра"):
+            details.setdefault("dates_or_duration", urgency.group(1))
     requirements = []
     for pattern in (
         r"\bс питомц\w*\b", r"\bбез (?:домашних )?(?:животн\w*|питомц\w*)\b",
@@ -314,12 +335,18 @@ def missing_critical_data(classification, categories, details):
     if not categories:
         missing.append("какая именно услуга нужна" if classification == "client" else "какие услуги предлагаются")
     if classification == "client":
-        for key, label in (
+        required = [
             ("dates_or_duration", "даты или срок"),
             ("budget", "бюджет"),
-            ("areas", "предпочтительный район"),
             ("people", "количество гостей"),
-        ):
+        ]
+        if "housing" in categories or {"car_rental", "bike_rental"}.intersection(categories):
+            required.append(("areas", "предпочтительный район"))
+        if "transfer" in categories:
+            required.append(("route", "маршрут поездки"))
+        if {"boats", "fishing"}.intersection(categories):
+            required.append(("destination", "маршрут или направление"))
+        for key, label in required:
             if key not in details:
                 missing.append(label)
     else:
@@ -392,9 +419,20 @@ def _client_request_sentence(categories, details):
     subject = "жильё"
     if "housing" in categories:
         subject = "виллу" if "вилл" in details.get("original_hint", "") else "жильё"
+    elif "boats" in categories:
+        hint = details.get("original_hint", "")
+        subject = (
+            "судно" if "судн" in hint
+            else "катер" if "катер" in hint
+            else "яхту" if "яхт" in hint
+            else "лодку" if "лодк" in hint
+            else "судно"
+        )
     elif categories:
         subject = _service_summary(categories)
     parts = [f"Вы ищете {subject}"]
+    if details.get("destination"):
+        parts.append("для поездки на " + details["destination"])
     if details.get("areas"):
         parts.append("в " + ", ".join(
             AREA_LOCATIVE.get(area, area) for area in details["areas"]
@@ -422,6 +460,10 @@ def _natural_client_questions(missing, details):
             questions.append("какой район Вы рассматриваете")
         elif field == "количество гостей":
             questions.append("сколько будет гостей")
+        elif field == "маршрут или направление":
+            questions.append("какой маршрут или направление Вы рассматриваете")
+        elif field == "маршрут поездки":
+            questions.append("откуда и куда нужна поездка")
         else:
             questions.append(field)
     if not questions:
@@ -535,6 +577,10 @@ def deterministic_partner_request(categories, details, missing):
         lines.append("— количество гостей: " + str(details["people"]))
     if details.get("budget"):
         lines.append("— бюджет: " + _format_budget(details["budget"]))
+    if details.get("destination"):
+        lines.append("— маршрут / направление: " + details["destination"])
+    if details.get("route"):
+        lines.append("— маршрут: " + details["route"])
     requirements = details.get("requirements") or []
     if requirements:
         lines.append("— требования: " + "; ".join(requirements))

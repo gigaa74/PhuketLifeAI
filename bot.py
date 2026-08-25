@@ -1187,10 +1187,13 @@ def _manual_lead_recommendation(lead):
     if missing:
         return "Уточнить у клиента: " + "; ".join(missing) + "."
     categories = set(lead.get("categories") or [])
+    compatible_categories = set(categories)
+    if categories.intersection({"boats", "fishing"}):
+        compatible_categories.add("excursions")
     matches = [
         partner for partner in list_partners()
         if partner.get("status") == "active"
-        and categories.intersection(partner.get("services") or [])
+        and compatible_categories.intersection(partner.get("services") or [])
     ]
     if matches:
         names = ", ".join(partner["name"] for partner in matches[:4])
@@ -1216,6 +1219,8 @@ def _format_manual_lead(lead):
         "budget": "бюджет",
         "people": "количество гостей",
         "requirements": "требования",
+        "destination": "маршрут / направление",
+        "route": "маршрут",
         "offer_source": "источник предложений и цен",
         "contact": "контакт",
         "delivery_model": "модель работы",
@@ -1254,6 +1259,10 @@ def _format_manual_lead(lead):
         "partner": "ждём ответ партнёров",
         "none": "ожиданий нет",
     }.get(lead.get("waiting_on"), "требуется решение владельца")
+    if lead["classification"] == "unclear" and lead.get("waiting_on") == "owner":
+        waiting_label = "требуется Ваше решение"
+    elif lead["classification"] == "partner" and lead.get("waiting_on") == "owner":
+        waiting_label = "кандидат ждёт нашего решения"
     heading = f"🔎 Найден потенциальный {labels[lead['classification']]}"
     if lead["classification"] == "unclear":
         heading = "🔎 Тип обращения не определён"
