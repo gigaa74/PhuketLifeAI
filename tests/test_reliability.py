@@ -1,12 +1,17 @@
+import asyncio
 import io
 import json
 import unittest
 from contextlib import redirect_stdout
+from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from reliability import (
     SlidingWindowRateLimiter,
     retry_call,
     safe_log,
+    telegram_error_handler,
 )
 
 
@@ -73,6 +78,20 @@ class ReliabilityTests(unittest.TestCase):
         self.assertNotIn("prompt_text", record)
         self.assertNotIn("telegram_username", record)
         self.assertNotIn("passport", output.getvalue())
+
+    def test_telegram_error_handler_logs_retry_after_without_message(self):
+        error = RuntimeError("private telegram payload")
+        error.retry_after = timedelta(seconds=7)
+        with patch("reliability.safe_log") as log:
+            asyncio.run(
+                telegram_error_handler(None, SimpleNamespace(error=error))
+            )
+        log.assert_called_once_with(
+            "telegram_application_error",
+            level="warning",
+            error=error,
+            retry_after_seconds=7.0,
+        )
 
 
 if __name__ == "__main__":

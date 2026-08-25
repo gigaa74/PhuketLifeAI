@@ -2,7 +2,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from database import get_connection
 from partner_authority import (
@@ -103,6 +103,7 @@ def _partner_from_row(row):
     result["areas"] = _decode_list(result.get("areas"))
     result["allowed_actions"] = _decode_list(result.get("allowed_actions"))
     result.pop("invite_token_hash", None)
+    result.pop("invite_expires_at", None)
     return result
 
 
@@ -242,15 +243,21 @@ def set_partner_auto_handoff(partner_id, enabled, db_path=None):
     return get_partner(partner_id, db_path)
 
 
-def create_partner_invite(partner_id, db_path=None):
+def create_partner_invite(partner_id, db_path=None, ttl_hours=24, now=None):
+    if float(ttl_hours) <= 0:
+        raise ValueError("Срок приглашения должен быть положительным")
+    issued_at = now or datetime.now(timezone.utc)
+    expires_at = issued_at + timedelta(hours=float(ttl_hours))
     token = secrets.token_urlsafe(24)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     connection = get_connection(db_path)
     try:
         with connection:
             cursor = connection.execute(
-                "UPDATE partners SET invite_token_hash = ?, updated_at = ? WHERE id = ?",
-                (token_hash, _now(), partner_id),
+                """UPDATE partners
+                   SET invite_token_hash = ?, invite_expires_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (token_hash, expires_at.isoformat(), issued_at.isoformat(), partner_id),
             )
         if not cursor.rowcount:
             raise PartnerUnavailableError("Партнёр не найден")
@@ -259,13 +266,20 @@ def create_partner_invite(partner_id, db_path=None):
     return token
 
 
-def onboard_partner(token, telegram_user_id, telegram_username=None, db_path=None):
+def onboard_partner(
+    token, telegram_user_id, telegram_username=None, db_path=None, now=None,
+):
     token_hash = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+    claimed_at = now or datetime.now(timezone.utc)
     connection = get_connection(db_path)
     connection.row_factory = sqlite3.Row
     try:
         row = connection.execute(
-            "SELECT id FROM partners WHERE invite_token_hash = ?", (token_hash,)
+            """SELECT id FROM partners
+               WHERE invite_token_hash = ?
+                 AND invite_expires_at IS NOT NULL
+                 AND invite_expires_at > ?""",
+            (token_hash, claimed_at.isoformat()),
         ).fetchone()
         if not row:
             raise PartnerUnavailableError("Приглашение недействительно")
@@ -275,11 +289,14 @@ def onboard_partner(token, telegram_user_id, telegram_username=None, db_path=Non
                     """
                     UPDATE partners
                     SET telegram_user_id = ?, telegram_username = ?,
-                        invite_token_hash = NULL, updated_at = ?
+                        invite_token_hash = NULL, invite_expires_at = NULL,
+                        updated_at = ?
                     WHERE id = ? AND invite_token_hash = ?
+                      AND invite_expires_at > ?
                     """,
                     (telegram_user_id, _normalize_telegram_username(telegram_username),
-                     _now(), row["id"], token_hash),
+                     claimed_at.isoformat(), row["id"], token_hash,
+                     claimed_at.isoformat()),
                 )
                 if claimed.rowcount != 1:
                     raise PartnerUnavailableError(

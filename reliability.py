@@ -104,3 +104,20 @@ class SlidingWindowRateLimiter:
                 return False
             events.append(now)
             return True
+
+
+async def telegram_error_handler(_update, context):
+    """Consume Telegram application errors without exposing payloads or tokens."""
+    error = getattr(context, "error", None)
+    retry_after = getattr(error, "retry_after", None)
+    if hasattr(retry_after, "total_seconds"):
+        retry_after = retry_after.total_seconds()
+    fields = {}
+    if isinstance(retry_after, (int, float)):
+        fields["retry_after_seconds"] = max(0.0, float(retry_after))
+    safe_log(
+        "telegram_application_error",
+        level="warning" if retry_after is not None else "error",
+        error=error,
+        **fields,
+    )

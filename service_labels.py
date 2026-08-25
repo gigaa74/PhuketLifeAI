@@ -1,8 +1,3 @@
-SCOUT_TYPE_LABELS_RU = {
-    "partner": "партнёр",
-    "client": "клиент",
-}
-
 CATEGORY_LABELS_RU = {
     "housing": "жильё",
     "car_rental": "аренда автомобилей",
@@ -17,10 +12,6 @@ CATEGORY_LABELS_RU = {
     "legal_visa": "юридические и визовые услуги",
     "relocation": "переезд и релокация",
 }
-
-
-def scout_type_label_ru(value):
-    return SCOUT_TYPE_LABELS_RU.get(value, str(value))
 
 
 def category_label_ru(value):

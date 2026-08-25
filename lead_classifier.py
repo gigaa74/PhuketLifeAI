@@ -1,6 +1,6 @@
 import re
 
-from scout_labels import category_label_ru
+from service_labels import category_label_ru
 
 
 CATEGORY_PATTERNS = {
@@ -30,7 +30,8 @@ CLIENT_INTENT = re.compile(
 )
 
 
-def classify_scout_message(scout_type, text):
+def classify_lead_message(lead_type, text):
+    """Return a deterministic lead signal used by manual owner intake."""
     value = " ".join(str(text or "").split())
     if len(value) < 12:
         return None
@@ -38,14 +39,14 @@ def classify_scout_message(scout_type, text):
         category for category, pattern in CATEGORY_PATTERNS.items()
         if re.search(pattern, value, re.I)
     ]
-    intent = PARTNER_INTENT.search(value) if scout_type == "partner" else CLIENT_INTENT.search(value)
+    intent = PARTNER_INTENT.search(value) if lead_type == "partner" else CLIENT_INTENT.search(value)
     if not categories or not intent:
         return None
     category = categories[0]
     reasons = [
         "Обнаружены категории: "
         + ", ".join(category_label_ru(item) for item in categories),
-        "Обнаружено предложение услуги" if scout_type == "partner"
+        "Обнаружено предложение услуги" if lead_type == "partner"
         else "Обнаружена явная потребность в услуге",
     ]
     return {

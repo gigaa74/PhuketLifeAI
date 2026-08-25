@@ -120,9 +120,9 @@ from manual_leads import (
     purge_expired_manual_leads,
     update_manual_lead,
 )
-from scout_labels import category_label_ru
+from service_labels import category_label_ru
 
-from reliability import safe_log
+from reliability import safe_log, telegram_error_handler
 from async_utils import run_blocking
 from gigachat_provider import generate_text
 from config import load_settings
@@ -1946,6 +1946,8 @@ def main():
             handle_message
         )
     )
+
+    app.add_error_handler(telegram_error_handler)
 
     print(
         "Phuket Life AI Concierge запущен!"

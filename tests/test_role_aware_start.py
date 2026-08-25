@@ -13,6 +13,7 @@ from database import (
     init_db,
 )
 from partner_applications import (
+    PartnerApplicationError,
     cancel_application,
     decide_application,
     get_application,
@@ -373,6 +374,37 @@ class RoleAwareStartTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(partner["status"], "active")
         self.assertEqual(partner["telegram_user_id"], 822345678)
         self.assertEqual(self._count("partners", "telegram_user_id=?", (822345678,)), 1)
+
+    async def test_owner_approve_rolls_back_partner_if_decision_write_fails(self):
+        application, _ = start_application(822345678, "applicant", self.db_path)
+        for answer in self.APPLICATION_ANSWERS:
+            application = record_application_answer(
+                application["id"], answer, self.db_path
+            )
+        connection = get_connection(self.db_path)
+        try:
+            with connection:
+                connection.execute(
+                    """CREATE TRIGGER fail_application_decision
+                       BEFORE UPDATE OF status ON partner_applications
+                       WHEN NEW.status='approved'
+                       BEGIN SELECT RAISE(ABORT, 'forced rollback'); END"""
+                )
+        finally:
+            connection.close()
+
+        with self.assertRaises(PartnerApplicationError):
+            decide_application(
+                application["id"], True, self.admin_id, db_path=self.db_path
+            )
+
+        self.assertEqual(
+            get_application(application["id"], self.db_path)["status"],
+            "needs_review",
+        )
+        self.assertEqual(
+            self._count("partners", "telegram_user_id=?", (822345678,)), 0
+        )
 
     async def test_owner_reject_grants_no_partner_access(self):
         application, _ = start_application(822345678, "applicant", self.db_path)

@@ -42,7 +42,7 @@ class DatabaseAndCaseTests(unittest.TestCase):
         self.assertTrue(
             {"category", "data", "missing_data", "priority"}.issubset(columns)
         )
-        self.assertEqual(versions, list(range(1, 13)))
+        self.assertEqual(versions, list(range(1, 14)))
 
     def test_file_database_uses_wal_and_safe_busy_settings(self):
         connection = get_connection(self.db_path)

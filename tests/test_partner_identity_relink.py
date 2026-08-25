@@ -123,8 +123,14 @@ class TwoStageMigrationTests(unittest.TestCase):
                            (telegram_user_id,status,current_step,applicant_name)
                            VALUES(123,'collecting','contact','Existing applicant')"""
                     )
+                partner_columns = [
+                    row[1] for row in connection.execute(
+                        "PRAGMA table_info(partners)"
+                    )
+                ]
+                selected_partner_columns = ", ".join(partner_columns)
                 before = connection.execute(
-                    "SELECT * FROM partners"
+                    f"SELECT {selected_partner_columns} FROM partners"
                 ).fetchall()
             finally:
                 connection.close()
@@ -147,12 +153,20 @@ class TwoStageMigrationTests(unittest.TestCase):
                        AND name='partner_identity_relink_requests'"""
                 ).fetchone())
                 self.assertEqual(
-                    connection.execute("SELECT * FROM partners").fetchall(), before
+                    connection.execute(
+                        f"SELECT {selected_partner_columns} FROM partners"
+                    ).fetchall(),
+                    before,
                 )
+                self.assertIn("invite_expires_at", {
+                    row[1] for row in connection.execute(
+                        "PRAGMA table_info(partners)"
+                    )
+                })
                 self.assertEqual(
                     [row[0] for row in connection.execute(
                         "SELECT version FROM schema_migrations ORDER BY version"
-                    )], list(range(1, 13)),
+                    )], list(range(1, 14)),
                 )
             finally:
                 connection.close()

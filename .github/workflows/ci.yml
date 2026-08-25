@@ -1,0 +1,39 @@
+name: Quality and security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pip-audit
+      - name: Audit dependencies
+        run: python -m pip_audit -r requirements.txt
+      - name: Compile source
+        run: python -m compileall -q . -x '/\.venv/'
+      - name: Run isolated tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          TELEGRAM_BOT_TOKEN: test-token
+          TELEGRAM_ADMIN_USER_ID: "1"
+          GIGACHAT_API_KEY: test-key
+          YANDEX_SEARCH_API_KEY: test-key
+          YANDEX_FOLDER_ID: test-folder
+        run: |
+          cd "$RUNNER_TEMP"
+          python -m unittest discover -s "$GITHUB_WORKSPACE/tests" -q

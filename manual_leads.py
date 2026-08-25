@@ -5,8 +5,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from database import get_connection
-from scout_detector import CATEGORY_PATTERNS, CLIENT_INTENT, PARTNER_INTENT
-from scout_labels import category_label_ru
+from lead_classifier import CATEGORY_PATTERNS, CLIENT_INTENT, PARTNER_INTENT
+from service_labels import category_label_ru
 from reliability import safe_log
 
 

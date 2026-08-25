@@ -469,6 +469,14 @@ def _migration_012_manual_leads(connection):
     )
 
 
+def _migration_013_partner_invite_expiry(connection):
+    columns = _column_names(connection, "partners")
+    if "invite_expires_at" not in columns:
+        connection.execute(
+            "ALTER TABLE partners ADD COLUMN invite_expires_at TEXT"
+        )
+
+
 MIGRATIONS = (
     (1, _migration_001_initial_schema),
     (2, _migration_002_case_fields),
@@ -482,6 +490,7 @@ MIGRATIONS = (
     (10, _migration_010_partner_referral_requests),
     (11, _migration_011_two_stage_partner_onboarding),
     (12, _migration_012_manual_leads),
+    (13, _migration_013_partner_invite_expiry),
 )
 
 

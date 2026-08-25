@@ -396,7 +396,7 @@ class ManualLeadCoreTests(unittest.TestCase):
         try:
             self.assertEqual(
                 [r[0] for r in connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-                list(range(1, 13)),
+                list(range(1, 14)),
             )
             for table, snapshot in before.items():
                 self.assertEqual(

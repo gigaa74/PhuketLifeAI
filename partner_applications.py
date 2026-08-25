@@ -3,14 +3,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from database import get_connection
-from partner_network import (
-    PartnerUnavailableError,
-    create_partner,
-    create_partner_invite,
-    onboard_partner,
-    resolve_partner_telegram_identity,
-    set_partner_status,
-)
+from partner_authority import OPERATIONAL_ACTIONS
 
 
 APPLICATION_STEPS = (
@@ -210,72 +203,124 @@ def list_applications(status="needs_review", db_path=None):
 
 def decide_application(application_id, approved, owner_id, note=None,
                        db_path=None):
-    application = get_application(application_id, db_path)
-    if not application:
-        raise PartnerApplicationError("Заявка не найдена")
-    if application["status"] in ("approved", "rejected"):
-        return application
-    if application["status"] != "needs_review":
-        raise PartnerApplicationError("Заявка ещё не готова к решению")
-    partner_id = None
-    if approved:
-        resolution = resolve_partner_telegram_identity(
-            application["telegram_user_id"],
-            application["telegram_username"],
-            db_path,
-        )
-        if resolution["status"] == "partner":
-            partner_id = resolution["partner"]["id"]
-        elif resolution["status"] == "conflict":
-            raise PartnerApplicationError(
-                "Telegram identity конфликтует с существующим партнёром"
-            )
-        else:
-            partner = create_partner(
-                application["applicant_name"], ["other"],
-                areas=application["areas_text"], status="candidate",
-                telegram_username=application["telegram_username"],
-                operational_notes=json.dumps({
-                    "application_answers": {
-                        key: application.get(key) for key in (
-                            "services_text", "areas_text",
-                            "delivery_model_text", "live_source_text",
-                            "availability_confirmation_text",
-                            "request_requirements_text",
-                            "commercial_model_text", "contact_text",
-                            "links_text", "licenses_text",
-                        )
-                    },
-                    "approved_terms": {},
-                    "open_questions": [
-                        "Коммерческие условия требуют явного подтверждения владельца"
-                    ],
-                }, ensure_ascii=False),
-                db_path=db_path,
-            )
-            try:
-                token = create_partner_invite(partner["id"], db_path)
-                linked = onboard_partner(
-                    token, application["telegram_user_id"],
-                    application["telegram_username"], db_path,
-                )
-                partner_id = set_partner_status(
-                    linked["id"], "active", db_path
-                )["id"]
-            except PartnerUnavailableError as error:
-                raise PartnerApplicationError(str(error)) from error
     connection = get_connection(db_path)
+    connection.row_factory = sqlite3.Row
     try:
-        with connection:
-            connection.execute(
-                """UPDATE partner_applications SET status=?, partner_id=?,
-                   decided_at=?, decided_by=?, decision_note=?, updated_at=?
-                   WHERE id=? AND status='needs_review'""",
-                (
-                    "approved" if approved else "rejected", partner_id,
-                    _now(), int(owner_id), note, _now(), application["id"],
-                ),
-            )
+        connection.execute("BEGIN IMMEDIATE")
+        application_row = connection.execute(
+            "SELECT * FROM partner_applications WHERE id=?",
+            (int(application_id),),
+        ).fetchone()
+        if not application_row:
+            raise PartnerApplicationError("Заявка не найдена")
+        application = dict(application_row)
+        if application["status"] in ("approved", "rejected"):
+            connection.rollback()
+            return application
+        if application["status"] != "needs_review":
+            raise PartnerApplicationError("Заявка ещё не готова к решению")
+
+        partner_id = None
+        decided_at = _now()
+        if approved:
+            user_id = int(application["telegram_user_id"])
+            username = _normalize_username(application["telegram_username"])
+            partner = connection.execute(
+                "SELECT id FROM partners WHERE telegram_user_id=?",
+                (user_id,),
+            ).fetchone()
+            if partner:
+                partner_id = partner["id"]
+            else:
+                username_matches = []
+                if username:
+                    username_matches = connection.execute(
+                        """SELECT id, telegram_user_id FROM partners
+                           WHERE lower(ltrim(COALESCE(telegram_username, ''), '@'))
+                                 = lower(?) ORDER BY id""",
+                        (username,),
+                    ).fetchall()
+                if len(username_matches) > 1 or (
+                    username_matches
+                    and username_matches[0]["telegram_user_id"] not in (None, user_id)
+                ):
+                    raise PartnerApplicationError(
+                        "Telegram identity конфликтует с существующим партнёром"
+                    )
+                if username_matches:
+                    partner_id = username_matches[0]["id"]
+                    connection.execute(
+                        """UPDATE partners SET telegram_user_id=?,
+                           telegram_username=?, status='active', updated_at=?
+                           WHERE id=? AND telegram_user_id IS NULL""",
+                        (user_id, username, decided_at, partner_id),
+                    )
+                    connection.execute(
+                        """INSERT INTO partner_commercial_audit
+                           (partner_id, action, actor_type, actor_id, details)
+                           VALUES (?, 'telegram_identity_linked', 'owner', ?, ?)""",
+                        (partner_id, int(owner_id), json.dumps({
+                            "source": "partner_application_approval"
+                        }, ensure_ascii=False)),
+                    )
+                else:
+                    operational_notes = json.dumps({
+                        "application_answers": {
+                            key: application.get(key) for key in (
+                                "services_text", "areas_text",
+                                "delivery_model_text", "live_source_text",
+                                "availability_confirmation_text",
+                                "request_requirements_text",
+                                "commercial_model_text", "contact_text",
+                                "links_text", "licenses_text",
+                            )
+                        },
+                        "approved_terms": {},
+                        "open_questions": [
+                            "Коммерческие условия требуют явного подтверждения владельца"
+                        ],
+                    }, ensure_ascii=False)
+                    cursor = connection.execute(
+                        """INSERT INTO partners
+                           (name, telegram_user_id, telegram_username, status,
+                            services, areas, updated_at, partner_type,
+                            allowed_actions, operational_notes)
+                           VALUES (?, ?, ?, 'active', ?, ?, ?,
+                                   'service_provider', ?, ?)""",
+                        (
+                            application["applicant_name"], user_id, username,
+                            json.dumps(["other"], ensure_ascii=False),
+                            json.dumps([
+                                item.strip() for item in str(
+                                    application.get("areas_text") or ""
+                                ).split(",") if item.strip()
+                            ], ensure_ascii=False),
+                            decided_at,
+                            json.dumps(sorted(OPERATIONAL_ACTIONS), ensure_ascii=False),
+                            operational_notes,
+                        ),
+                    )
+                    partner_id = cursor.lastrowid
+
+        updated = connection.execute(
+            """UPDATE partner_applications SET status=?, partner_id=?,
+               decided_at=?, decided_by=?, decision_note=?, updated_at=?
+               WHERE id=? AND status='needs_review'""",
+            (
+                "approved" if approved else "rejected", partner_id,
+                decided_at, int(owner_id), note, decided_at, application["id"],
+            ),
+        )
+        if updated.rowcount != 1:
+            raise PartnerApplicationError("Решение по заявке уже изменилось")
+        connection.commit()
+    except (PartnerApplicationError, sqlite3.IntegrityError) as error:
+        connection.rollback()
+        if isinstance(error, PartnerApplicationError):
+            raise
+        raise PartnerApplicationError(
+            "Не удалось безопасно утвердить партнёрскую заявку"
+        ) from error
     finally:
         connection.close()
     return get_application(application["id"], db_path)

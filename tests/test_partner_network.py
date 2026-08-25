@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -103,6 +104,18 @@ class PartnerNetworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(linked["telegram_user_id"], 778899)
         with self.assertRaises(PartnerUnavailableError):
             onboard_partner(token, 998877, "attacker", self.db_path)
+
+    def test_partner_invite_expires(self):
+        partner = self._partner("Expiring Invite")
+        issued_at = datetime(2026, 8, 25, tzinfo=timezone.utc)
+        token = create_partner_invite(
+            partner["id"], self.db_path, ttl_hours=1, now=issued_at
+        )
+        with self.assertRaises(PartnerUnavailableError):
+            onboard_partner(
+                token, 778899, "late_partner", self.db_path,
+                now=issued_at + timedelta(hours=1, seconds=1),
+            )
 
     def test_matching_filters_service_area_and_status(self):
         housing = self._partner("Housing")
@@ -271,7 +284,7 @@ class PartnerMigrationTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(case_title, "Legacy case")
             self.assertEqual(partner_name, "Legacy partner")
-            self.assertEqual(versions, list(range(1, 13)))
+            self.assertEqual(versions, list(range(1, 14)))
             self.assertIsNotNone(request_table)
 
 
