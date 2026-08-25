@@ -23,6 +23,7 @@ __pycache__/
 attachments/
 exports/
 runtime/
+logs/
 backups/
 .vscode/
 .idea/
