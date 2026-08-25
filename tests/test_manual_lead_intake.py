@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -11,8 +12,12 @@ from manual_leads import (
     build_analysis,
     classify_manual_lead,
     create_manual_lead,
+    delete_manual_lead,
     find_manual_lead,
+    generation_prompt,
     get_manual_lead,
+    purge_expired_manual_leads,
+    redact_personal_data,
     update_manual_lead,
 )
 
@@ -37,6 +42,88 @@ class ManualLeadCoreTests(unittest.TestCase):
         self.assertEqual(partner["categories"], ["car_rental", "bike_rental"])
         self.assertEqual(unclear["classification"], "unclear")
         self.assertEqual(unclear["signal"], "требуется ручная проверка")
+
+    def test_external_ai_prompt_redacts_direct_identifiers(self):
+        raw = (
+            "Ищу квартиру. Телефон +7 999 123-45-67, test@example.com, "
+            "Telegram @private_user, https://t.me/private_user, "
+            "анкета https://example.com/private/profile"
+        )
+        prompt = generation_prompt(
+            "client", ["housing"],
+            {
+                "areas": ["Карон"],
+                "contact": "+7 999 123-45-67",
+                "nested": {
+                    "telegram_user_id": 123456789,
+                    "profile_url": "https://example.com/private/profile",
+                },
+            },
+            ["бюджет"], raw,
+        )
+        for secret in (
+            "+7 999 123-45-67", "test@example.com", "@private_user",
+            "https://t.me/private_user", "https://example.com/private/profile",
+            "123456789",
+        ):
+            self.assertNotIn(secret, prompt)
+        self.assertIn("Карон", prompt)
+
+    def test_storage_is_redacted_and_expired_leads_can_be_purged(self):
+        raw = "Ищу квартиру, связь +7 999 123-45-67 или @private_user"
+        lead, _ = create_manual_lead(
+            90001, raw, build_analysis(raw), db_path=self.db_path
+        )
+        stored = get_manual_lead(lead["id"], self.db_path)
+        self.assertNotIn("+7 999 123-45-67", stored["original_text"])
+        self.assertNotIn("@private_user", stored["original_text"])
+        connection = get_connection(self.db_path)
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE manual_leads SET created_at=? WHERE id=?",
+                    ((datetime.now(timezone.utc) - timedelta(days=31)).isoformat(), lead["id"]),
+                )
+        finally:
+            connection.close()
+        self.assertEqual(
+            purge_expired_manual_leads(db_path=self.db_path), 1
+        )
+        self.assertIsNone(get_manual_lead(lead["id"], self.db_path))
+
+    def test_owner_can_delete_lead_data(self):
+        lead, _ = create_manual_lead(
+            90001, "Ищу квартиру", build_analysis("Ищу квартиру"),
+            db_path=self.db_path,
+        )
+        self.assertTrue(delete_manual_lead(lead["id"], self.db_path))
+        self.assertFalse(delete_manual_lead(lead["id"], self.db_path))
+
+    def test_retention_pass_sanitizes_legacy_raw_rows(self):
+        analysis = build_analysis("Ищу квартиру")
+        lead, _ = create_manual_lead(
+            90001, "Ищу квартиру", analysis, db_path=self.db_path
+        )
+        connection = get_connection(self.db_path)
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE manual_leads SET original_text=? WHERE id=?",
+                    ("Связь +7 999 123-45-67 и @private_user", lead["id"]),
+                )
+        finally:
+            connection.close()
+        self.assertEqual(purge_expired_manual_leads(db_path=self.db_path), 0)
+        stored = get_manual_lead(lead["id"], self.db_path)["original_text"]
+        self.assertNotIn("+7 999 123-45-67", stored)
+        self.assertNotIn("@private_user", stored)
+
+    def test_redaction_does_not_remove_business_numbers(self):
+        value = redact_personal_data(
+            "Бюджет 150000 бат, 4 человека, с 10.09.2026 по 10.10.2026"
+        )
+        self.assertIn("150000", value)
+        self.assertIn("10.09.2026", value)
 
     def test_extracts_only_present_facts_and_does_not_repeat_questions(self):
         result = build_analysis(
@@ -362,6 +449,12 @@ class ManualLeadBotTests(unittest.IsolatedAsyncioTestCase):
             "update_manual_lead": lambda lead_id, **kwargs: update_manual_lead(
                 lead_id, **kwargs, db_path=self.db_path
             ),
+            "delete_manual_lead": lambda lead_id: delete_manual_lead(
+                lead_id, self.db_path
+            ),
+            "purge_expired_manual_leads": lambda: purge_expired_manual_leads(
+                db_path=self.db_path
+            ),
         }
         with ExitStack() as stack:
             for name, value in replacements.items():
@@ -467,6 +560,8 @@ class ManualLeadBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_manual_lead(lead["id"], self.db_path)["status"], "in_progress")
         await callback(f"lead:reject:{lead['id']}")
         self.assertEqual(get_manual_lead(lead["id"], self.db_path)["status"], "rejected")
+        await callback(f"lead:delete:{lead['id']}")
+        self.assertIsNone(get_manual_lead(lead["id"], self.db_path))
 
 
 if __name__ == "__main__":

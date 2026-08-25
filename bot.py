@@ -77,7 +77,6 @@ from admin_ui import (
     format_partner_open_questions,
     format_partner_operations,
     offer_action_buttons,
-    partner_auto_confirmation_buttons,
     partner_action_buttons,
     commercial_proposal_buttons,
     pending_proposal_list_buttons,
@@ -125,8 +124,10 @@ from manual_leads import (
     ManualLeadError,
     build_analysis as build_manual_lead_analysis,
     create_manual_lead,
+    delete_manual_lead,
     find_manual_lead,
     get_manual_lead,
+    purge_expired_manual_leads,
     update_manual_lead,
 )
 from scout_labels import category_label_ru
@@ -1683,13 +1684,12 @@ async def _show_partner_auto_confirmation(query, partner_id):
         await query.edit_message_text("Партнёр не найден.")
         return
     await query.edit_message_text(
-        "Включить автоматическую отправку одобренных запросов партнёру "
-        f"{partner['name']}?\n\n"
-        "Неподтверждённые коммерческие условия и заявки без разрешения "
-        "отправляться не будут.",
-        reply_markup=_admin_keyboard(
-            partner_auto_confirmation_buttons(partner_id)
-        ),
+        "🔒 Автоотправка отключена политикой Phuket Life.\n\n"
+        f"Предложения партнёра «{partner['name']}» отправляются клиенту "
+        "только после Вашего явного подтверждения.",
+        reply_markup=_admin_keyboard([[
+            ("⬅️ Назад к партнёру", f"partner:view:{partner_id}")
+        ]]),
     )
 
 
@@ -1791,6 +1791,7 @@ def _manual_lead_buttons(lead_id):
         ],
         [("🔄 Обновить тексты", f"lead:regen:{lead_id}")],
         [("🚫 Не подходит", f"lead:reject:{lead_id}")],
+        [("🗑 Удалить данные", f"lead:delete:{lead_id}")],
     ])
 
 
@@ -1884,6 +1885,7 @@ async def manual_lead_intake_handler(update, context):
     text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
     if not text.strip() or text.lstrip().startswith("/"):
         return
+    purge_expired_manual_leads()
     source_chat_id, source_message_id, metadata, source, username = _manual_lead_source(message)
     existing = find_manual_lead(
         user.id, text, source_chat_id=source_chat_id,
@@ -2213,6 +2215,12 @@ async def admin_callback_handler(update, context):
             await query.edit_message_text(
                 "🚫 Лид отмечен как неподходящий. Автоматические действия не выполнялись."
             )
+        elif parts[:2] == ["lead", "delete"]:
+            deleted = delete_manual_lead(int(parts[2]))
+            await query.edit_message_text(
+                "🗑 Данные лида удалены."
+                if deleted else "Данные лида уже были удалены."
+            )
         elif parts[:2] == ["lead", "type"]:
             lead = get_manual_lead(int(parts[2]))
             if not lead:
@@ -2375,36 +2383,16 @@ async def partner_reply_handler(update, context):
     admin_id = SETTINGS.telegram_admin_user_id
     partner = get_partner(request["partner_id"])
     offer = None
-    auto_send_succeeded = False
-    auto_send_failed = False
     if request["status"] == "responded" and not proposal:
         try:
             offer = create_offer_from_partner_response(
                 request["id"], SETTINGS.partner_handoff_mode
             )
-            if offer and offer["handoff_decision"] == "auto_send":
-                try:
-                    offer = await send_offer_to_client(
-                        offer["id"], context.bot.send_message
-                    )
-                    auto_send_succeeded = True
-                except OfferTelegramError:
-                    auto_send_failed = True
         except OfferHandoffError:
             offer = None
     if admin_id:
         if proposal:
             notification = format_commercial_proposal_card(proposal, partner)
-        elif auto_send_succeeded:
-            notification = (
-                "✅ Новый ответ партнёра\n\n"
-                f"Предложение №{offer['id']} проверено и отправлено клиенту."
-            )
-        elif auto_send_failed:
-            notification = (
-                "❌ Не удалось отправить предложение клиенту\n\n"
-                f"Предложение №{offer['id']} не отмечено как отправленное."
-            )
         elif offer:
             notification = format_offer_review_card(
                 offer,
@@ -2425,7 +2413,7 @@ async def partner_reply_handler(update, context):
                 reply_markup = _admin_keyboard(
                     commercial_proposal_buttons(proposal["id"], partner["id"])
                 )
-            elif offer and not auto_send_succeeded:
+            elif offer:
                 reply_markup = _admin_keyboard(
                     offer_action_buttons(
                         offer["id"], offer["case_id"], offer["partner_id"]
@@ -3005,6 +2993,7 @@ async def handle_message(
 def main():
 
     init_db()
+    purge_expired_manual_leads()
 
     app = (
         Application

@@ -221,6 +221,10 @@ def set_partner_status(partner_id, status, db_path=None):
 
 
 def set_partner_auto_handoff(partner_id, enabled, db_path=None):
+    if enabled:
+        raise PartnerUnavailableError(
+            "Автоотправка отключена политикой Phuket Life: требуется решение владельца"
+        )
     connection = get_connection(db_path)
     try:
         with connection:
@@ -267,16 +271,20 @@ def onboard_partner(token, telegram_user_id, telegram_username=None, db_path=Non
             raise PartnerUnavailableError("Приглашение недействительно")
         try:
             with connection:
-                connection.execute(
+                claimed = connection.execute(
                     """
                     UPDATE partners
                     SET telegram_user_id = ?, telegram_username = ?,
                         invite_token_hash = NULL, updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND invite_token_hash = ?
                     """,
                     (telegram_user_id, _normalize_telegram_username(telegram_username),
-                     _now(), row["id"]),
+                     _now(), row["id"], token_hash),
                 )
+                if claimed.rowcount != 1:
+                    raise PartnerUnavailableError(
+                        "Приглашение уже использовано или заменено"
+                    )
         except sqlite3.IntegrityError as error:
             raise PartnerUnavailableError(
                 "Telegram уже связан с другим партнёром"

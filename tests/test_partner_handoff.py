@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 import tempfile
@@ -10,14 +11,16 @@ from database import get_connection, init_db
 from partner_handoff import (
     DeterministicOfferExtractor,
     DuplicateOfferSendError,
+    OfferHandoffError,
     OfferTelegramError,
     create_offer_from_partner_response,
     format_client_offer,
     get_offer,
+    reject_offer,
     send_offer_to_client,
     validate_partner_offer,
 )
-from partner_network import create_partner, set_partner_auto_handoff
+from partner_network import create_partner
 
 
 class PartnerHandoffTests(unittest.IsolatedAsyncioTestCase):
@@ -55,6 +58,17 @@ class PartnerHandoffTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def _enable_legacy_auto_flag(self):
+        connection = get_connection(self.db_path)
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE partners SET auto_handoff_enabled=1 WHERE id=?",
+                    (self.partner["id"],),
+                )
+        finally:
+            connection.close()
 
     def _request(self, response, status="responded", partner_id=None):
         connection = get_connection(self.db_path)
@@ -141,23 +155,24 @@ class PartnerHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("partner_auto_handoff_disabled", offer["validation_reasons"])
 
     def test_global_review_overrides_trusted_partner(self):
-        set_partner_auto_handoff(self.partner["id"], True, self.db_path)
+        self._enable_legacy_auto_flag()
         offer = create_offer_from_partner_response(
             self._request(self._valid_response()), "review", db_path=self.db_path
         )
         self.assertEqual(offer["handoff_decision"], "review_required")
         self.assertIn("global_review_mode", offer["validation_reasons"])
 
-    def test_trusted_partner_hybrid_valid_offer_is_auto_send(self):
-        set_partner_auto_handoff(self.partner["id"], True, self.db_path)
+    def test_trusted_partner_hybrid_still_requires_owner_approval(self):
+        self._enable_legacy_auto_flag()
         offer = create_offer_from_partner_response(
             self._request(self._valid_response()), "hybrid", db_path=self.db_path
         )
-        self.assertEqual(offer["handoff_decision"], "auto_send")
-        self.assertEqual(offer["status"], "ready_to_send")
+        self.assertEqual(offer["handoff_decision"], "review_required")
+        self.assertEqual(offer["status"], "needs_review")
+        self.assertIn("owner_approval_required", offer["validation_reasons"])
 
     def test_ambiguous_multi_option_requires_review(self):
-        set_partner_auto_handoff(self.partner["id"], True, self.db_path)
+        self._enable_legacy_auto_flag()
         raw = (
             "Вариант 1: 40 000 THB https://example.com/one\n"
             "Вариант 2: 50 000 THB https://example.com/two"
@@ -169,7 +184,7 @@ class PartnerHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("multiple_options_require_review", offer["validation_reasons"])
 
     def test_location_conflict_and_partner_contact_require_review(self):
-        set_partner_auto_handoff(self.partner["id"], True, self.db_path)
+        self._enable_legacy_auto_flag()
         raw = "Вариант в Kata 45 000 THB, пишите @partner_private"
         offer = create_offer_from_partner_response(
             self._request(raw), "hybrid", db_path=self.db_path
@@ -191,7 +206,8 @@ class PartnerHandoffTests(unittest.IsolatedAsyncioTestCase):
         result = validate_partner_offer(
             offer, self._case(), partner, "hybrid", {"status": "responded"}, extracted
         )
-        self.assertEqual(result["decision"], "auto_send")
+        self.assertEqual(result["decision"], "review_required")
+        self.assertIn("owner_approval_required", result["reasons"])
         self.assertFalse(any("budget" in reason for reason in result["reasons"]))
 
     def test_same_currency_does_not_generate_in_budget_claim(self):
@@ -246,6 +262,32 @@ class PartnerHandoffTests(unittest.IsolatedAsyncioTestCase):
         failed = get_offer(offer["id"], self.db_path)
         self.assertNotEqual(failed["status"], "sent_to_client")
         self.assertEqual(failed["error_message"], "RuntimeError")
+
+    async def test_concurrent_send_is_claimed_only_once(self):
+        offer = create_offer_from_partner_response(
+            self._request(self._valid_response()), "review", db_path=self.db_path
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def sender(**kwargs):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(message_id=556)
+
+        first = asyncio.create_task(send_offer_to_client(
+            offer["id"], sender, manual_approval=True, db_path=self.db_path
+        ))
+        await entered.wait()
+        with self.assertRaises(DuplicateOfferSendError):
+            await send_offer_to_client(
+                offer["id"], sender, manual_approval=True, db_path=self.db_path
+            )
+        with self.assertRaises(OfferHandoffError):
+            reject_offer(offer["id"], self.db_path)
+        release.set()
+        sent = await first
+        self.assertEqual(sent["status"], "sent_to_client")
 
     def test_two_partners_create_independent_offers(self):
         second = create_partner(

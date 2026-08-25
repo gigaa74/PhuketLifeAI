@@ -145,7 +145,7 @@ class PartnerCardRussianUxTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("⬅️ Назад к партнёру",
                        f"partner:view:{self.partner['id']}"), callbacks)
 
-    async def test_auto_handoff_requires_confirmation_and_does_not_mutate(self):
+    async def test_auto_handoff_screen_explains_manual_policy(self):
         before = self._database_snapshot()
         query = SimpleNamespace(edit_message_text=AsyncMock())
         with patch.object(
@@ -158,11 +158,10 @@ class PartnerCardRussianUxTests(unittest.IsolatedAsyncioTestCase):
         callbacks = _callbacks(
             query.edit_message_text.await_args.kwargs["reply_markup"]
         )
-        self.assertIn("Включить автоматическую отправку", text)
-        self.assertIn(("✅ Подтвердить",
-                       f"partner:auto:{self.partner['id']}:on"), callbacks)
-        self.assertIn(("❌ Отмена",
+        self.assertIn("Автоотправка отключена", text)
+        self.assertIn(("⬅️ Назад к партнёру",
                        f"partner:view:{self.partner['id']}"), callbacks)
+        self.assertFalse(any("partner:auto:" in callback for _, callback in callbacks))
         self.assertEqual(before, self._database_snapshot())
         self.assertFalse(get_partner(
             self.partner["id"], self.db_path

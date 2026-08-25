@@ -19,7 +19,7 @@ from partner_handoff import (
     DuplicateOfferSendError,
     create_offer_from_partner_response,
 )
-from partner_network import create_partner
+from partner_network import PartnerUnavailableError, create_partner
 
 
 class AdminUiTests(unittest.IsolatedAsyncioTestCase):
@@ -112,11 +112,11 @@ class AdminUiTests(unittest.IsolatedAsyncioTestCase):
             await execute_offer_send(offer["id"], sender, self.db_path)
         self.assertEqual(sender.await_count, 1)
 
-    def test_partner_auto_handoff_toggle_uses_service_action(self):
-        enabled = execute_partner_auto_toggle(
-            self.partner["id"], True, self.db_path
-        )
-        self.assertEqual(enabled["auto_handoff_enabled"], 1)
+    def test_partner_auto_handoff_cannot_be_enabled(self):
+        with self.assertRaises(PartnerUnavailableError):
+            execute_partner_auto_toggle(
+                self.partner["id"], True, self.db_path
+            )
         disabled = execute_partner_auto_toggle(
             self.partner["id"], False, self.db_path
         )

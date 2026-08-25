@@ -227,7 +227,10 @@ def validate_partner_offer(
         return {"decision": "declined", "reasons": ["partner_declined"], "score": 0.0}
 
     extracted = extracted or DeterministicOfferExtractor().extract(raw)
-    reasons = []
+    # Current product policy requires an explicit owner decision for every
+    # client-facing delivery. Legacy auto-handoff flags are intentionally
+    # ignored until the owner changes this policy in a future reviewed sprint.
+    reasons = ["owner_approval_required"]
     if handoff_mode != "hybrid":
         reasons.append("global_review_mode")
     if not partner or partner.get("status") != "active":
@@ -276,7 +279,7 @@ def validate_partner_offer(
         reasons.append("parser_error")
 
     reasons = list(dict.fromkeys(reasons))
-    decision = "review_required" if reasons else "auto_send"
+    decision = "review_required"
     score = max(0.0, 1.0 - 0.1 * len(reasons))
     return {"decision": decision, "reasons": reasons, "score": score}
 
@@ -411,16 +414,36 @@ async def send_offer_to_client(
     offer = get_offer(offer_id, db_path)
     if not offer:
         raise OfferHandoffError("Предложение не найдено")
-    if offer["status"] == "sent_to_client":
-        raise DuplicateOfferSendError("Предложение уже отправлено клиенту")
-    allowed = (
-        offer["status"] == "ready_to_send" and offer["handoff_decision"] == "auto_send"
-    ) or (manual_approval and offer["status"] == "needs_review")
-    if not allowed:
+    if offer["status"] in {"sending", "sent_to_client"}:
+        raise DuplicateOfferSendError(
+            "Предложение уже отправляется или отправлено клиенту"
+        )
+    if not manual_approval:
+        raise OfferHandoffError("Требуется подтверждение владельца")
+    original_status = offer["status"]
+    if original_status not in {"needs_review", "ready_to_send"}:
         raise OfferHandoffError("Предложение не разрешено к отправке")
-    context = get_offer_context(offer_id, db_path)
-    message_text = format_client_offer(offer, context)
+
+    connection = get_connection(db_path)
     try:
+        with connection:
+            claimed = connection.execute(
+                """
+                UPDATE partner_offers SET status = 'sending', updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (_now(), int(offer_id), original_status),
+            )
+        if claimed.rowcount != 1:
+            raise DuplicateOfferSendError(
+                "Предложение уже отправляется или было обработано"
+            )
+    finally:
+        connection.close()
+
+    try:
+        context = get_offer_context(offer_id, db_path)
+        message_text = format_client_offer(offer, context)
         message = await telegram_sender(
             chat_id=context["client_telegram_id"], text=message_text
         )
@@ -436,10 +459,11 @@ async def send_offer_to_client(
             with connection:
                 connection.execute(
                     """
-                    UPDATE partner_offers SET error_code = 'telegram_failure',
-                        error_message = ?, updated_at = ? WHERE id = ?
+                    UPDATE partner_offers SET status = ?,
+                        error_code = 'telegram_failure', error_message = ?,
+                        updated_at = ? WHERE id = ? AND status = 'sending'
                     """,
-                    (type(error).__name__, _now(), offer_id),
+                    (original_status, type(error).__name__, _now(), offer_id),
                 )
         finally:
             connection.close()
@@ -447,13 +471,18 @@ async def send_offer_to_client(
     connection = get_connection(db_path)
     try:
         with connection:
-            connection.execute(
+            finalized = connection.execute(
                 """
                 UPDATE partner_offers SET status = 'sent_to_client', sent_at = ?,
                     client_telegram_message_id = ?, error_code = NULL,
-                    error_message = NULL, updated_at = ? WHERE id = ?
+                    error_message = NULL, updated_at = ?
+                WHERE id = ? AND status = 'sending'
                 """,
                 (_now(), message_id, _now(), offer_id),
+            )
+        if finalized.rowcount != 1:
+            raise OfferHandoffError(
+                "Состояние отправки изменилось до сохранения подтверждения Telegram"
             )
     finally:
         connection.close()
@@ -461,16 +490,18 @@ async def send_offer_to_client(
 
 
 def reject_offer(offer_id, db_path=None):
-    offer = get_offer(offer_id, db_path)
-    if not offer or offer["status"] == "sent_to_client":
-        raise OfferHandoffError("Предложение нельзя отклонить")
     connection = get_connection(db_path)
     try:
         with connection:
-            connection.execute(
-                "UPDATE partner_offers SET status = 'rejected', updated_at = ? WHERE id = ?",
+            cursor = connection.execute(
+                """
+                UPDATE partner_offers SET status = 'rejected', updated_at = ?
+                WHERE id = ? AND status NOT IN ('sending', 'sent_to_client')
+                """,
                 (_now(), offer_id),
             )
+        if cursor.rowcount != 1:
+            raise OfferHandoffError("Предложение нельзя отклонить")
     finally:
         connection.close()
     return get_offer(offer_id, db_path)

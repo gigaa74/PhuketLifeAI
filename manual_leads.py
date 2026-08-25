@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from database import get_connection
 from scout_detector import CATEGORY_PATTERNS, CLIENT_INTENT, PARTNER_INTENT
@@ -11,6 +11,26 @@ from scout_labels import category_label_ru
 
 LEAD_TYPES = {"client", "partner", "unclear"}
 LEAD_STATUSES = {"needs_review", "ready", "in_progress", "rejected"}
+MANUAL_LEAD_RETENTION_DAYS = 30
+
+_EMAIL_PATTERN = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?!\w)")
+_TELEGRAM_LINK_PATTERN = re.compile(
+    r"https?://(?:t\.me|telegram\.me)/[A-Za-z0-9_/?=&-]+", re.I
+)
+_WEB_LINK_PATTERN = re.compile(r"https?://[^\s<>]+|www\.[^\s<>]+", re.I)
+_TELEGRAM_USERNAME_PATTERN = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{5,}")
+_PHONE_PATTERN = re.compile(r"(?<!\w)(?:\+?\d[\s().-]*){10,15}(?!\w)")
+_LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_SENSITIVE_LABEL_PATTERN = re.compile(
+    r"\b(?:паспорт|passport|номер\s+брони|booking\s*(?:number|code)|qr(?:-?код)?)"
+    r"\s*[:№#-]?\s*[A-Za-zА-Яа-я0-9-]{4,}",
+    re.I,
+)
+_DIRECT_IDENTIFIER_KEYS = {
+    "contact", "email", "phone", "telephone", "username",
+    "telegram_username", "telegram_user_id", "telegram_id", "user_id",
+    "chat_id", "source_user_id", "source_chat_id", "message_source",
+}
 
 AREA_ALIASES = {
     "Карон": ("карон", "кароне", "karon"),
@@ -48,6 +68,49 @@ def normalize_content(text):
 
 def content_hash(text):
     return hashlib.sha256(normalize_content(text).encode("utf-8")).hexdigest()
+
+
+def redact_personal_data(text):
+    """Remove direct identifiers before external AI use or SQLite storage."""
+    value = str(text or "")
+    value = _TELEGRAM_LINK_PATTERN.sub("[ССЫЛКА TELEGRAM СКРЫТА]", value)
+    value = _WEB_LINK_PATTERN.sub("[ССЫЛКА СКРЫТА]", value)
+    value = _EMAIL_PATTERN.sub("[EMAIL СКРЫТ]", value)
+    value = _TELEGRAM_USERNAME_PATTERN.sub("[TELEGRAM СКРЫТ]", value)
+    value = _PHONE_PATTERN.sub("[ТЕЛЕФОН СКРЫТ]", value)
+    value = _LONG_NUMBER_PATTERN.sub("[НОМЕР СКРЫТ]", value)
+    value = _SENSITIVE_LABEL_PATTERN.sub("[ЧУВСТВИТЕЛЬНЫЕ ДАННЫЕ СКРЫТЫ]", value)
+    return value
+
+
+def _is_direct_identifier_key(key):
+    normalized = str(key).casefold()
+    return (
+        normalized in _DIRECT_IDENTIFIER_KEYS
+        or normalized.endswith("_id")
+        or any(marker in normalized for marker in (
+            "contact", "email", "phone", "username", "passport",
+            "booking", "reservation", "ticket_number",
+        ))
+    )
+
+
+def _external_ai_value(value):
+    if isinstance(value, str):
+        return redact_personal_data(value)
+    if isinstance(value, list):
+        return [_external_ai_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _external_ai_value(item)
+            for key, item in value.items()
+            if not _is_direct_identifier_key(key)
+        }
+    return value
+
+
+def _external_ai_details(details):
+    return _external_ai_value(details or {})
 
 
 def classify_manual_lead(text):
@@ -448,7 +511,8 @@ def deterministic_partner_request(categories, details, missing):
 
 
 def generation_prompt(classification, categories, details, missing, original_text):
-    facts = json.dumps(details, ensure_ascii=False, sort_keys=True)
+    facts = json.dumps(_external_ai_details(details), ensure_ascii=False, sort_keys=True)
+    safe_original = redact_personal_data(original_text)
     return (
         "Подготовь только один короткий персонализированный черновик на русском языке с обращением на «Вы». "
         "Всегда говори от лица команды: только «мы», никогда «я». "
@@ -465,7 +529,7 @@ def generation_prompt(classification, categories, details, missing, original_tex
         "владелец рассмотрит их и команда свяжется для согласования формата. "
         "Не используй фразы «организовать услуги», «предложу дальнейший порядок действий» или «я помогу». "
         f"Тип: {classification}. Категории: {categories}. Факты: {facts}. Недостаёт: {missing}.\n"
-        "<UNTRUSTED_FORWARD>\n" + str(original_text)[:12000] + "\n</UNTRUSTED_FORWARD>"
+        "<UNTRUSTED_FORWARD>\n" + safe_original[:12000] + "\n</UNTRUSTED_FORWARD>"
     )
 
 
@@ -571,6 +635,7 @@ def create_manual_lead(owner_telegram_id, original_text, analysis, *,
                        source_chat_id=None, source_message_id=None,
                        source_metadata=None, db_path=None):
     normalized_hash = content_hash(original_text)
+    stored_text = redact_personal_data(original_text)
     connection = get_connection(db_path); connection.row_factory = sqlite3.Row
     try:
         with connection:
@@ -596,7 +661,7 @@ def create_manual_lead(owner_telegram_id, original_text, analysis, *,
                     status, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (int(owner_telegram_id), source_chat_id, source_message_id,
-                 json.dumps(source_metadata or {}, ensure_ascii=False), original_text,
+                 json.dumps(source_metadata or {}, ensure_ascii=False), stored_text,
                  normalized_hash, analysis["classification"],
                  json.dumps(analysis["categories"], ensure_ascii=False),
                  json.dumps(_analysis_payload(analysis), ensure_ascii=False),
@@ -635,6 +700,45 @@ def get_manual_lead(lead_id, db_path=None):
     connection = get_connection(db_path); connection.row_factory = sqlite3.Row
     try:
         return _decode(connection.execute("SELECT * FROM manual_leads WHERE id=?", (int(lead_id),)).fetchone())
+    finally:
+        connection.close()
+
+
+def delete_manual_lead(lead_id, db_path=None):
+    connection = get_connection(db_path)
+    try:
+        with connection:
+            cursor = connection.execute(
+                "DELETE FROM manual_leads WHERE id=?", (int(lead_id),)
+            )
+        return bool(cursor.rowcount)
+    finally:
+        connection.close()
+
+
+def purge_expired_manual_leads(*, retention_days=MANUAL_LEAD_RETENTION_DAYS,
+                               now=None, db_path=None):
+    """Sanitize legacy rows and remove leads older than the retention window."""
+    if int(retention_days) < 1:
+        raise ManualLeadError("Срок хранения должен быть положительным")
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=int(retention_days))
+    connection = get_connection(db_path)
+    try:
+        with connection:
+            for row in connection.execute(
+                "SELECT id, original_text FROM manual_leads"
+            ).fetchall():
+                safe_text = redact_personal_data(row[1])
+                if safe_text != row[1]:
+                    connection.execute(
+                        "UPDATE manual_leads SET original_text=?, updated_at=? WHERE id=?",
+                        (safe_text, _now(), row[0]),
+                    )
+            cursor = connection.execute(
+                "DELETE FROM manual_leads WHERE julianday(created_at) <= julianday(?)",
+                (cutoff.isoformat(),),
+            )
+        return int(cursor.rowcount)
     finally:
         connection.close()
 

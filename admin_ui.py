@@ -55,19 +55,8 @@ def partner_action_buttons(partner_id, auto_handoff_enabled, case_id=None,
     ])
     if auto_handoff_enabled:
         rows.append([("⛔ Выключить автоотправку", f"partner:auto:{partner_id}:off")])
-    else:
-        rows.append([(
-            "✅ Включить автоотправку", f"partner:auto_confirm:{partner_id}"
-        )])
     rows.append([("⬅️ К списку партнёров", "admin:partners")])
     return rows
-
-
-def partner_auto_confirmation_buttons(partner_id):
-    return [
-        [("✅ Подтвердить", f"partner:auto:{partner_id}:on")],
-        [("❌ Отмена", f"partner:view:{partner_id}")],
-    ]
 
 
 def commercial_proposal_buttons(proposal_id, partner_id):

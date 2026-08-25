@@ -10,6 +10,7 @@ from database import get_connection, init_db
 from partner_network import (
     DuplicatePartnerRequestError,
     PartnerTelegramError,
+    PartnerUnavailableError,
     create_partner,
     create_partner_invite,
     find_partners_for_case,
@@ -94,6 +95,14 @@ class PartnerNetworkTests(unittest.IsolatedAsyncioTestCase):
             partner,
             find_partners_for_case(self._case("transfer"), self.db_path),
         )
+
+    def test_partner_invite_can_only_be_claimed_once(self):
+        partner = self._partner("Invite Partner")
+        token = create_partner_invite(partner["id"], self.db_path)
+        linked = onboard_partner(token, 778899, "invite_partner", self.db_path)
+        self.assertEqual(linked["telegram_user_id"], 778899)
+        with self.assertRaises(PartnerUnavailableError):
+            onboard_partner(token, 998877, "attacker", self.db_path)
 
     def test_matching_filters_service_area_and_status(self):
         housing = self._partner("Housing")
